@@ -7,13 +7,10 @@ COLS = ["entity_id", "business_name", "business_address", "country"]
 
 
 def read_tsv(path) -> pl.DataFrame:
-    return pl.read_csv(
-        path,
-        separator="\t",
-        quote_char=None,
-        infer_schema=False,
-        missing_utf8_is_empty_string=True,
-    )
+    # all columns as strings, no quote handling; empty fields -> "" (not null). Avoids the
+    # read_csv empty-string option, which was renamed across polars versions.
+    df = pl.read_csv(path, separator="\t", quote_char=None, infer_schema=False)
+    return df.with_columns(pl.all().fill_null(""))
 
 
 def main():

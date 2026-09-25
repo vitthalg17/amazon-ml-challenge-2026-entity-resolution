@@ -47,6 +47,14 @@ Smoke test on a 2% sample of Source 2/3 (about 15 min on a laptop):
 python pipeline.py --pct 2
 ```
 
+Smaller machine (e.g. Colab High-RAM): train on 30% of train Source 2/3, predict on all of test.
+When the train and test percentages differ, the S1-context features and the per-entity
+decision rule are switched off, because they depend on how many S2/S3 records were blocked.
+
+```bash
+python pipeline.py --train-pct 30
+```
+
 Resume from any step, e.g. after changing the model only:
 
 ```bash

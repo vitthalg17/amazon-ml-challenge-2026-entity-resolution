@@ -1,6 +1,6 @@
 # Minimum versions for older Python images (e.g. SageMaker Python 3.10/3.11).
 numpy>=1.24
-polars>=1.20
+polars>=1.20,<2
 pyarrow>=14
 scipy>=1.10
 scikit-learn>=1.3

@@ -8,6 +8,7 @@ unmatched records, whose own id) hashes to fold f uses the transliteration dicti
 without fold f, so train features look like test features (dictionary never saw the pair).
 """
 import argparse
+import re
 import time
 
 import polars as pl
@@ -21,17 +22,31 @@ def norm_path(split: str, source: int, pct: int = 100):
     return WORK_DIR / f"{split}_s{source}_norm{tag}.parquet"
 
 
-def load_norm(split: str, source: int, pct: int = 100, columns=None) -> pl.DataFrame:
-    """Normalized source; for S2/S3 with pct < 100, a deterministic hash sample."""
+def _source_file(split: str, source: int, pct: int):
+    """Smallest up-to-date normalized file that contains the pct sample: the exact sample, the
+    full file, or a larger sample (e.g. the 6% stage-1 sample read from a --train-pct 30 prep)."""
     p = norm_path(split, source, pct if source > 1 else 100)
     full = norm_path(split, source, 100)
     # a sampled file older than the full one was normalized with outdated rules: re-sample
     if p.exists() and (p == full or not full.exists() or p.stat().st_mtime >= full.stat().st_mtime):
-        return pl.read_parquet(p, columns=columns)
-    lf = pl.scan_parquet(norm_path(split, source, 100))
+        return p
+    if full.exists():
+        return full
+    larger = sorted((int(m.group(1)), f) for f in WORK_DIR.glob(f"{split}_s{source}_norm_p*.parquet")
+                    if (m := re.search(r"_p(\d+)\.parquet$", f.name)) and int(m.group(1)) >= pct)
+    if larger:
+        return larger[0][1]
+    raise FileNotFoundError(f"no normalized {split} source {source} covering {pct}%: run prep")
+
+
+def load_norm(split: str, source: int, pct: int = 100, columns=None, lazy: bool = False):
+    """Normalized source; for S2/S3 with pct < 100, a deterministic hash sample."""
+    lf = pl.scan_parquet(_source_file(split, source, pct))
     if source > 1 and pct < 100:
         lf = lf.filter(pl.col("entity_id").hash(SEED) % 100 < pct)
-    return (lf.select(columns) if columns else lf).collect()
+    if columns:
+        lf = lf.select(columns)
+    return lf if lazy else lf.collect()
 
 
 def _normalize_crossfit(lf: pl.LazyFrame, source: int, n: int) -> pl.DataFrame:

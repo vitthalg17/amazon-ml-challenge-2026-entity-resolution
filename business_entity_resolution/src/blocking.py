@@ -112,9 +112,9 @@ def block_country(s1: pl.DataFrame, oth: pl.DataFrame, k: dict[str, int] | None 
         # Retrieval cost is the sum of posting-list lengths of each query's features, so very
         # common features (" sh", "rd", "mh") are dropped from the *query* side for retrieval
         # only. They carry little IDF weight; full vectors are kept for the cosines.
-        Qr = Q @ sp.diags((np.diff(BT.indptr) <= max_df).astype(np.float32))
-        Qr.eliminate_zeros()
-        mats[ch] = (Q, A, BT, Qr)
+        keep = sp.diags((np.diff(BT.indptr) <= max_df).astype(np.float32))
+        mats[ch] = (Q, A, BT, keep)  # mask applied per chunk: no second copy of every Q
+        t1[ch] = to[ch] = None
     del t1, to
     print(f"    vectorized in {time.time() - t0:.0f}s", flush=True)
 
@@ -123,8 +123,10 @@ def block_country(s1: pl.DataFrame, oth: pl.DataFrame, k: dict[str, int] | None 
     for s in range(0, oth.height, CHUNK):
         e = min(s + CHUNK, oth.height)
         parts = [exact.filter(pl.col("oi").is_between(s, e - 1))]
-        for ch, (Q, A, BT, Qr) in mats.items():
-            parts.append(topk_pairs(Qr[s:e], BT, (k or {}).get(ch, CHANNEL_SPECS[ch]["k"]),
+        for ch, (Q, A, BT, keep) in mats.items():
+            Qr = Q[s:e] @ keep
+            Qr.eliminate_zeros()
+            parts.append(topk_pairs(Qr, BT, (k or {}).get(ch, CHANNEL_SPECS[ch]["k"]),
                                     thresh, f"rank_{ch}", s))
         cand = (pl.concat(parts, how="diagonal")
                 .group_by("oi", "si")
@@ -154,13 +156,16 @@ def candidates_path(split: str, pct: int = 100, raw: bool = False):
     return WORK_DIR / f"{split}_candidates{tag}.parquet"
 
 
+BLOCK_COLS = ["entity_id", "country", "name_core", "name_norm", "addr_norm"]  # all blocking needs
+
+
 def run(split: str, pct: int = 100, k: dict[str, int] | None = None, raw: bool = False):
     """raw=True skips stage-1 pruning (used to produce stage-1 training data)."""
     pruner = None if raw else stage1.load_model()
     if not raw and pruner is None:
         raise SystemExit("stage-1 model missing: run blocking --raw on a train sample, then stage1.py")
-    s1 = load_norm(split, 1, 100)
-    oth = pl.concat([load_norm(split, s, pct) for s in (2, 3)])
+    s1 = load_norm(split, 1, 100, columns=BLOCK_COLS)
+    oth = pl.concat([load_norm(split, s, pct, columns=BLOCK_COLS) for s in (2, 3)])
     out = []
     for country in sorted(s1["country"].unique().to_list()):
         a = s1.filter(pl.col("country") == country)

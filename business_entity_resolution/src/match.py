@@ -56,9 +56,11 @@ def build(split: str, pct: int) -> pl.DataFrame:
     s1 = s1_all.join(cand.select(pl.col("s1_id").unique()), left_on="entity_id",
                      right_on="s1_id", how="semi")
     del s1_all
-    oth = pl.concat([load_norm(split, s, pct) for s in (2, 3)])
-    oth = oth.join(cand.select(pl.col("other_id").unique()), left_on="entity_id",
-                   right_on="other_id", how="semi")
+    # read only the S2/S3 rows that are candidates (lazy semi-join: never the full sources)
+    ids = cand.lazy().select(pl.col("other_id").unique())
+    oth = pl.concat([load_norm(split, s, pct, lazy=True)
+                     .join(ids, left_on="entity_id", right_on="other_id", how="semi").collect()
+                     for s in (2, 3)])
     df = features.build_features(cand, s1, oth, *idf)
     if split == "train":
         gt = pl.read_parquet(WORK_DIR / "train_gt_pairs.parquet")
@@ -70,8 +72,18 @@ def build(split: str, pct: int) -> pl.DataFrame:
     return df
 
 
-def feature_cols(df: pl.DataFrame) -> list[str]:
-    return [c for c in df.columns if c not in ("other_id", "s1_id", "country", "label")]
+FEATURES_PATH = WORK_DIR / "stage2_features.json"
+
+
+def is_s1_context(c: str) -> bool:
+    """Features that aggregate over all S2/S3 candidates of one S1 entity. Their scale depends on
+    what fraction of S2/S3 was blocked, so they only transfer if train and test use the same %."""
+    return c.endswith("_gap_s") or c in ("rank_s", "ncand_s")
+
+
+def feature_cols(df: pl.DataFrame, density_matched: bool = True) -> list[str]:
+    cols = [c for c in df.columns if c not in ("other_id", "s1_id", "country", "label")]
+    return [c for c in cols if density_matched or not is_s1_context(c)]
 
 
 def decide(pairs: pl.DataFrame, t: float) -> pl.DataFrame:
@@ -110,9 +122,14 @@ def apply_rule(pairs: pl.DataFrame, dec: dict) -> pl.DataFrame:
     return decide(pairs, dec["threshold"])
 
 
-def train(pct: int):
+def train(pct: int, density_matched: bool = True):
+    """density_matched=False when train uses a smaller %% of Source 2/3 than test (--train-pct):
+    per-S1 aggregates then differ between train and test, so the S1-context features and the
+    per-entity decision rule are left out."""
     df = load_features("train", pct)
-    cols = feature_cols(df)
+    cols = feature_cols(df, density_matched)
+    with open(FEATURES_PATH, "w") as fh:
+        json.dump(cols, fh)
     X = df.select(cols).cast(pl.Float32).to_numpy()
     y = df["label"].to_numpy()
     fold = (df["s1_id"].hash(SEED) % N_FOLDS).to_numpy()
@@ -134,12 +151,12 @@ def train(pct: int):
 
     pairs = df.select("s1_id", "other_id").with_columns(p=pl.Series(oof))
     pairs.write_parquet(WORK_DIR / f"train_oof{'' if pct >= 100 else f'_p{pct}'}.parquet")
-    best = evaluate(pairs, pct)
+    best = evaluate(pairs, pct, rules=("threshold", "entity") if density_matched else ("threshold",))
     with open(WORK_DIR / "decision.json", "w") as fh:
         json.dump(best, fh)
 
 
-def evaluate(pairs: pl.DataFrame, pct: int) -> dict:
+def evaluate(pairs: pl.DataFrame, pct: int, rules=("threshold", "entity")) -> dict:
     """Grid-search both decision rules on OOF probabilities; returns the best as a decision dict."""
     gt = pl.read_parquet(WORK_DIR / "train_gt_pairs.parquet")
     s1_all = load_norm("train", 1, 100, columns=["entity_id"])["entity_id"]
@@ -152,6 +169,7 @@ def evaluate(pairs: pl.DataFrame, pct: int) -> dict:
         s1_all = pl.concat([gt["s1"], pairs["s1_id"]]).unique()
     grids = {"threshold": np.round(np.arange(0.02, 0.99, 0.01), 2),
              "entity": np.round(np.arange(-3.0, 3.01, 0.25), 2)}
+    grids = {r: g for r, g in grids.items() if r in rules}
     rows = []
     for rule, grid in grids.items():
         key = "shift" if rule == "entity" else "threshold"
@@ -176,7 +194,8 @@ def evaluate(pairs: pl.DataFrame, pct: int) -> dict:
 
 def predict(pct: int = 100):
     df = load_features("test", pct)
-    cols = feature_cols(df)
+    with open(FEATURES_PATH) as fh:
+        cols = json.load(fh)  # exactly the features the fold models were trained on
     X = df.select(cols).cast(pl.Float32).to_numpy()
     p = np.mean([lgb.Booster(model_file=str(WORK_DIR / f"stage2_fold{f}.txt"))
                  .predict(X, num_threads=N_THREADS) for f in range(N_FOLDS)], axis=0)
@@ -209,10 +228,11 @@ if __name__ == "__main__":
     ap.add_argument("cmd", choices=["features", "train", "predict"])
     ap.add_argument("--split", default="train", choices=["train", "test"])
     ap.add_argument("--pct", type=int, default=100)
+    ap.add_argument("--test-pct", type=int, default=None, help="train only: %% test will use")
     a = ap.parse_args()
     if a.cmd == "features":
         build(a.split, a.pct)
     elif a.cmd == "train":
-        train(a.pct)
+        train(a.pct, density_matched=(a.test_pct or a.pct) == a.pct)
     else:
         predict(a.pct)

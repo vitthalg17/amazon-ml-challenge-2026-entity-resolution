@@ -2,6 +2,7 @@
 
     python pipeline.py                      # full run (all steps)
     python pipeline.py --pct 2              # smoke test on a 2% hash-sample of Source 2/3
+    python pipeline.py --train-pct 30       # smaller machine: train on 30%, predict on full test
     python pipeline.py --steps block_test match_features_test predict   # resume from a step
 
 Steps (in order):
@@ -29,7 +30,7 @@ STEPS = ["ingest", "translit", "prep_train", "prep_test", "stage1_data", "stage1
          "match_features_test", "train", "predict", "validate"]
 
 
-def run_step(step: str, pct: int, stage1_pct: int):
+def run_step(step: str, train_pct: int, test_pct: int, stage1_pct: int):
     import blocking
     import eval_blocking
     import match
@@ -42,24 +43,30 @@ def run_step(step: str, pct: int, stage1_pct: int):
     elif step == "translit":
         import normalize
         import translit
-        translit.build(min(pct, 100))
+        translit.build(train_pct)
         normalize.reload_translit()
-    elif step in ("prep_train", "prep_test"):
-        prep.prep(step.split("_")[1], pct)
+    elif step == "prep_train":
+        prep.prep("train", train_pct)
+    elif step == "prep_test":
+        prep.prep("test", test_pct)
     elif step == "stage1_data":
-        blocking.run("train", min(pct, stage1_pct), raw=True)
+        blocking.run("train", min(train_pct, stage1_pct), raw=True)
     elif step == "stage1":
-        stage1.train(min(pct, stage1_pct))
-    elif step in ("block_train", "block_test"):
-        blocking.run(step.split("_")[1], pct)
+        stage1.train(min(train_pct, stage1_pct))
+    elif step == "block_train":
+        blocking.run("train", train_pct)
+    elif step == "block_test":
+        blocking.run("test", test_pct)
     elif step == "eval_blocking":
-        eval_blocking.evaluate(pct)
-    elif step in ("match_features_train", "match_features_test"):
-        match.build(step.split("_")[-1], pct)
+        eval_blocking.evaluate(train_pct)
+    elif step == "match_features_train":
+        match.build("train", train_pct)
+    elif step == "match_features_test":
+        match.build("test", test_pct)
     elif step == "train":
-        match.train(pct)
+        match.train(train_pct, density_matched=train_pct == test_pct)
     elif step == "predict":
-        match.predict(pct)
+        match.predict(test_pct)
     elif step == "validate":
         validator = DATA_DIR.parent / "utils" / "validate_submission.py"
         rc = subprocess.call([sys.executable, str(validator),
@@ -72,15 +79,24 @@ def run_step(step: str, pct: int, stage1_pct: int):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
-    ap.add_argument("--pct", type=int, default=100, help="%% of Source 2/3 to use (smoke tests)")
+    ap.add_argument("--pct", type=int, default=100,
+                    help="%% of Source 2/3 used for BOTH splits (smoke tests)")
+    ap.add_argument("--train-pct", type=int, default=None,
+                    help="%% of train Source 2/3 to train on (overrides --pct for train), e.g. 30 "
+                         "on small machines. Keep test at 100 for a real submission.")
+    ap.add_argument("--test-pct", type=int, default=None,
+                    help="%% of test Source 2/3 (overrides --pct for test)")
     ap.add_argument("--stage1-pct", type=int, default=6,
                     help="%% of train Source 2/3 used to train the two cross-fitted stage-1 pruners")
     ap.add_argument("--steps", nargs="+", default=STEPS, choices=STEPS)
     a = ap.parse_args()
+    train_pct = a.train_pct if a.train_pct is not None else a.pct
+    test_pct = a.test_pct if a.test_pct is not None else a.pct
+    print(f"train_pct={train_pct} test_pct={test_pct} stage1_pct={a.stage1_pct}", flush=True)
     for step in [s for s in STEPS if s in a.steps]:
         t = time.time()
         print(f"\n===== {step} =====", flush=True)
-        run_step(step, a.pct, a.stage1_pct)
+        run_step(step, train_pct, test_pct, a.stage1_pct)
         print(f"===== {step} done in {time.time() - t:.0f}s", flush=True)
 
 

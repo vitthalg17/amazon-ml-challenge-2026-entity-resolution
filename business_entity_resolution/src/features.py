@@ -1,0 +1,117 @@
+"""Pair features for the matching model.
+
+Groups:
+  retrieval  - the three blocking cosines and per-channel ranks
+  name       - rapidfuzz similarities on core / full names, token Jaccard, DBA alt-name match
+  address    - token Jaccard / containment, fuzzy ratios, house-number agreement
+  record     - lengths, empty address, Indic script, domain-as-name, source
+  context    - how this pair compares with the other candidates of the same S2/S3 record
+               and of the same S1 entity (each S2/S3 record belongs to at most one S1)
+"""
+import os
+
+import numpy as np
+import polars as pl
+from rapidfuzz import fuzz, process
+from rapidfuzz.distance import JaroWinkler
+
+N_WORKERS = int(os.environ.get("ER_THREADS", os.cpu_count() or 4))
+SIDE_COLS = ["entity_id", "business_name", "name_norm", "name_core", "name_alt",
+             "addr_norm", "addr_nums"]
+
+FEATURES: list[str] = []  # filled by build_features (order used by the model)
+
+
+def _cp(a: list[str], b: list[str], scorer) -> np.ndarray:
+    return process.cpdist(a, b, scorer=scorer, workers=N_WORKERS, dtype=np.float32)
+
+
+def _jacc(a: str, b: str) -> list[pl.Expr]:
+    A, B = pl.col(a).str.split(" "), pl.col(b).str.split(" ")
+    inter = A.list.set_intersection(B).list.len()
+    return [
+        (inter / A.list.set_union(B).list.len().clip(1)).cast(pl.Float32),
+        (inter / A.list.len().clip(1)).cast(pl.Float32),
+        inter.cast(pl.Int16),
+    ]
+
+
+def build_features(cand: pl.DataFrame, s1: pl.DataFrame, oth: pl.DataFrame) -> pl.DataFrame:
+    """cand: blocking output (other_id, s1_id, cos_*, rank_*). s1/oth: normalized sources."""
+    df = (cand
+          .join(oth.select(SIDE_COLS), left_on="other_id", right_on="entity_id")
+          .join(s1.select(SIDE_COLS), left_on="s1_id", right_on="entity_id", suffix="_1"))
+
+    nc, nc1 = df["name_core"].to_list(), df["name_core_1"].to_list()
+    nn, nn1 = df["name_norm"].to_list(), df["name_norm_1"].to_list()
+    ad, ad1 = df["addr_norm"].to_list(), df["addr_norm_1"].to_list()
+    fz = {
+        "n_ratio": _cp(nc, nc1, fuzz.ratio),
+        "n_tsort": _cp(nc, nc1, fuzz.token_sort_ratio),
+        "n_tset": _cp(nc, nc1, fuzz.token_set_ratio),
+        "n_partial": _cp(nc, nc1, fuzz.partial_ratio),
+        "n_jw": _cp(nc, nc1, JaroWinkler.normalized_similarity),
+        "n_full_tsort": _cp(nn, nn1, fuzz.token_sort_ratio),
+        "n_alt_tset": _cp(df["name_alt"].to_list(), nc1, fuzz.token_set_ratio),
+        "a_tset": _cp(ad, ad1, fuzz.token_set_ratio),
+        "a_tsort": _cp(ad, ad1, fuzz.token_sort_ratio),
+        "a_partial": _cp(ad, ad1, fuzz.partial_ratio),
+    }
+    df = df.with_columns(**{k: pl.Series(v) for k, v in fz.items()})
+    del nc, nc1, nn, nn1, ad, ad1, fz
+
+    nj, nc_, ni = _jacc("name_core", "name_core_1")
+    aj, ac, ai = _jacc("addr_norm", "addr_norm_1")
+    mj, mc, mi = _jacc("addr_nums", "addr_nums_1")
+    first = pl.col("addr_nums").str.extract(r"^(\d+)")
+    first1 = pl.col("addr_nums_1").str.extract(r"^(\d+)")
+    raw = pl.col("business_name")
+    df = df.with_columns(
+        n_jacc=nj, n_contain=nc_, n_inter=ni,
+        a_jacc=aj, a_contain=ac, a_inter=ai,
+        num_jacc=mj, num_contain=mc, num_inter=mi,
+        num_first_eq=(first == first1).fill_null(False).cast(pl.Int8),
+        num_first_prefix=((first.is_not_null() & first1.is_not_null())
+                          & (first1.str.starts_with(first.fill_null("#"))
+                             | first.str.starts_with(first1.fill_null("#")))).fill_null(False).cast(pl.Int8),
+        n_first_tok_eq=(pl.col("name_core").str.extract(r"^(\S+)")
+                        == pl.col("name_core_1").str.extract(r"^(\S+)")).fill_null(False).cast(pl.Int8),
+        n_len=pl.col("name_core").str.len_chars().cast(pl.Int16),
+        n_len_1=pl.col("name_core_1").str.len_chars().cast(pl.Int16),
+        n_ntok=pl.col("name_core").str.count_matches(r"\S+").cast(pl.Int16),
+        n_ntok_1=pl.col("name_core_1").str.count_matches(r"\S+").cast(pl.Int16),
+        a_ntok=pl.col("addr_norm").str.count_matches(r"\S+").cast(pl.Int16),
+        a_ntok_1=pl.col("addr_norm_1").str.count_matches(r"\S+").cast(pl.Int16),
+        a_nnum=pl.col("addr_nums").str.count_matches(r"\S+").cast(pl.Int16),
+        addr_empty=(pl.col("addr_norm") == "").cast(pl.Int8),
+        name_indic=raw.str.contains(r"[ऀ-෿]").cast(pl.Int8),
+        name_domain=raw.str.contains(r"(?i)\.(com|net|org|in|co|biz|info|fr|io)\b|www\.").cast(pl.Int8),
+        name_upper=(raw == raw.str.to_uppercase()).cast(pl.Int8),
+        has_alt=(pl.col("name_alt") != "").cast(pl.Int8),
+        src3=pl.col("other_id").str.starts_with("S3-").cast(pl.Int8),
+    )
+
+    # context: compare with the other candidates of the same S2/S3 record / same S1 entity
+    df = df.with_columns(cos_sum=pl.sum_horizontal(pl.col("^cos_.*$")))
+    ctx = []
+    for c in ("cos_name_word", "cos_name_char", "cos_addr", "cos_combo", "cos_sum", "p1",
+              "n_tset", "a_tset"):
+        ctx += [
+            (pl.col(c).max().over("other_id") - pl.col(c)).alias(f"{c}_gap_o"),
+            (pl.col(c).max().over("s1_id") - pl.col(c)).alias(f"{c}_gap_s"),
+        ]
+    ctx += [
+        pl.col("cos_sum").rank("ordinal", descending=True).over("other_id").cast(pl.Int16).alias("rank_o"),
+        pl.col("cos_sum").rank("ordinal", descending=True).over("s1_id").cast(pl.Int16).alias("rank_s"),
+        pl.len().over("other_id").cast(pl.Int16).alias("ncand_o"),
+        pl.len().over("s1_id").cast(pl.Int16).alias("ncand_s"),
+        # second-best competitor margin for the S2/S3 record
+        (pl.col("cos_sum") - pl.col("cos_sum").sort(descending=True).slice(1, 1).first()
+         .over("other_id")).fill_null(1.0).alias("cos_sum_margin2_o"),
+    ]
+    df = df.with_columns(ctx)
+
+    drop = [c for c in df.columns if c in SIDE_COLS or c.endswith("_1") and c[:-2] in SIDE_COLS]
+    df = df.drop([c for c in drop if c != "entity_id"], strict=False)
+    FEATURES[:] = [c for c in df.columns if c not in ("other_id", "s1_id", "country", "label")]
+    return df

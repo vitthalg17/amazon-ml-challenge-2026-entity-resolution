@@ -1,0 +1,9 @@
+student_resource/
+work/
+output/
+*.zip
+__pycache__/
+*.pyc
+work_smoke/
+output_smoke/
+*.log

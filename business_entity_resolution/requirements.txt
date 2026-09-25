@@ -1,0 +1,11 @@
+# Exact versions the pipeline was developed and tested with (Python 3.14, CPU only).
+# If this Python is older and a pin has no wheel, use requirements-min.txt instead.
+numpy==2.5.3
+polars==1.44.2
+pyarrow==25.0.1
+scipy==1.18.1
+scikit-learn==1.9.1
+lightgbm==4.7.0
+rapidfuzz==3.14.6
+sparse_dot_topn==1.2.0
+anyascii==0.3.3

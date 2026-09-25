@@ -1,12 +1,17 @@
-"""Stage-2 matching model: features -> LightGBM -> one-S1-per-record assignment -> threshold.
+"""Stage-2 matching model: features -> LightGBM -> one-S1-per-record assignment -> decision rule.
 
 train:   builds features on the pruned train candidates, trains K models on S1-entity folds,
-         collects out-of-fold probabilities, then picks the threshold that maximizes macro F0.5.
+         collects out-of-fold probabilities, then picks the decision rule and its parameter that
+         maximize macro F0.5 on them.
 predict: scores the test candidates with the fold-model average, applies the same decision
          rule, and writes output/matching_results.tsv + output/candidate_pairs.tsv.
 
-Decision rule: every S2/S3 record belongs to at most one S1 (true in the training labels),
-so each record is assigned only to its highest-probability S1, and only if p >= threshold.
+Every S2/S3 record belongs to at most one S1 (true in the training labels), so each record is
+assigned only to its highest-probability S1. Two rules then decide what to keep:
+  threshold  keep the assignment if p >= t (one global cut)
+  entity     per S1 entity, keep the top-k assigned records (k may be 0) that maximize the
+             entity's expected F0.5, i.e. the metric itself (decision-theoretic F-measure
+             optimisation, Ye et al. ICML 2012); `shift` recalibrates p in logit space
 """
 import argparse
 import json
@@ -35,16 +40,26 @@ def feature_path(split: str, pct: int):
     return WORK_DIR / f"{split}_features{'' if pct >= 100 else f'_p{pct}'}.parquet"
 
 
+def load_features(split: str, pct: int) -> pl.DataFrame:
+    """Cached features, rebuilt when the candidates were regenerated after the cache was written."""
+    fp, cp = feature_path(split, pct), candidates_path(split, pct)
+    if fp.exists() and fp.stat().st_mtime >= cp.stat().st_mtime:
+        return pl.read_parquet(fp)
+    return build(split, pct)
+
+
 def build(split: str, pct: int) -> pl.DataFrame:
     t = time.time()
     cand = pl.read_parquet(candidates_path(split, pct))
-    s1 = load_norm(split, 1, 100).join(cand.select(pl.col("s1_id").unique()),
-                                                         left_on="entity_id", right_on="s1_id",
-                                                         how="semi")
+    s1_all = load_norm(split, 1, 100)
+    idf = features.token_idf(s1_all["name_core"]), features.token_idf(s1_all["addr_norm"])
+    s1 = s1_all.join(cand.select(pl.col("s1_id").unique()), left_on="entity_id",
+                     right_on="s1_id", how="semi")
+    del s1_all
     oth = pl.concat([load_norm(split, s, pct) for s in (2, 3)])
     oth = oth.join(cand.select(pl.col("other_id").unique()), left_on="entity_id",
                    right_on="other_id", how="semi")
-    df = features.build_features(cand, s1, oth)
+    df = features.build_features(cand, s1, oth, *idf)
     if split == "train":
         gt = pl.read_parquet(WORK_DIR / "train_gt_pairs.parquet")
         df = (df.join(gt.with_columns(label=pl.lit(1, pl.Int8)), left_on=["s1_id", "other_id"],
@@ -67,19 +82,49 @@ def decide(pairs: pl.DataFrame, t: float) -> pl.DataFrame:
             .select(pl.col("s1_id").alias("s1"), pl.col("other_id").alias("other")))
 
 
+def decide_entity(pairs: pl.DataFrame, shift: float) -> pl.DataFrame:
+    """Per S1 entity keep the top-k assigned records maximizing expected F0.5 with
+    q = sigmoid(logit(p) + shift):
+      keep none: E[F] = P(entity is a singleton) = prod(1 - q) over all its candidates
+      keep k:    E[F] ~= 1.25 * (sum of the k kept q) / (0.25 * sum of all its q + k)
+    """
+    lg = (pl.col("p").clip(1e-6, 1 - 1e-6) / (1 - pl.col("p").clip(1e-6, 1 - 1e-6))).log()
+    q = pairs.with_columns(q=(1 / (1 + (-(lg + shift)).exp())).clip(1e-6, 1 - 1e-6))
+    ent = q.group_by("s1_id").agg(q_all=pl.col("q").sum(),
+                                  p_none=(1 - pl.col("q")).log().sum().exp())
+    kept = (q.sort("q", descending=True).unique("other_id", keep="first")
+            .sort(["s1_id", "q"], descending=[False, True])
+            .join(ent, on="s1_id")
+            .with_columns(k=pl.col("q").cum_count().over("s1_id"),
+                          cum=pl.col("q").cum_sum().over("s1_id"))
+            .with_columns(ef=1.25 * pl.col("cum") / (0.25 * pl.col("q_all") + pl.col("k")))
+            .with_columns(k_best=pl.col("k").get(pl.col("ef").arg_max()).over("s1_id"),
+                          ef_best=pl.col("ef").max().over("s1_id"))
+            .filter((pl.col("ef_best") > pl.col("p_none")) & (pl.col("k") <= pl.col("k_best"))))
+    return kept.select(pl.col("s1_id").alias("s1"), pl.col("other_id").alias("other"))
+
+
+def apply_rule(pairs: pl.DataFrame, dec: dict) -> pl.DataFrame:
+    if dec.get("rule") == "entity":
+        return decide_entity(pairs, dec["shift"])
+    return decide(pairs, dec["threshold"])
+
+
 def train(pct: int):
-    df = pl.read_parquet(feature_path("train", pct)) if feature_path("train", pct).exists() \
-        else build("train", pct)
+    df = load_features("train", pct)
     cols = feature_cols(df)
-    X = df.select(cols).to_numpy().astype(np.float32)
+    X = df.select(cols).cast(pl.Float32).to_numpy()
     y = df["label"].to_numpy()
     fold = (df["s1_id"].hash(SEED) % N_FOLDS).to_numpy()
+    # early stopping uses S1 entities held out of the training folds, not the OOF fold itself
+    stop = (df["s1_id"].hash(SEED + 1) % 10 == 0).to_numpy()
     oof = np.zeros(len(y), dtype=np.float32)
     for f in range(N_FOLDS):
         t = time.time()
-        tr, va = fold != f, fold == f
+        va = fold == f
+        tr, es = ~va & ~stop, ~va & stop
         m = lgb.train(PARAMS, lgb.Dataset(X[tr], y[tr], feature_name=cols), N_ROUNDS,
-                      valid_sets=[lgb.Dataset(X[va], y[va])],
+                      valid_sets=[lgb.Dataset(X[es], y[es])],
                       callbacks=[lgb.early_stopping(50, verbose=False)])
         oof[va] = m.predict(X[va], num_threads=N_THREADS)
         m.save_model(str(WORK_DIR / f"stage2_fold{f}.txt"))
@@ -91,10 +136,11 @@ def train(pct: int):
     pairs.write_parquet(WORK_DIR / f"train_oof{'' if pct >= 100 else f'_p{pct}'}.parquet")
     best = evaluate(pairs, pct)
     with open(WORK_DIR / "decision.json", "w") as fh:
-        json.dump({"threshold": best}, fh)
+        json.dump(best, fh)
 
 
-def evaluate(pairs: pl.DataFrame, pct: int) -> float:
+def evaluate(pairs: pl.DataFrame, pct: int) -> dict:
+    """Grid-search both decision rules on OOF probabilities; returns the best as a decision dict."""
     gt = pl.read_parquet(WORK_DIR / "train_gt_pairs.parquet")
     s1_all = load_norm("train", 1, 100, columns=["entity_id"])["entity_id"]
     if pct < 100:
@@ -104,30 +150,42 @@ def evaluate(pairs: pl.DataFrame, pct: int) -> float:
                          for s in (2, 3)])
         gt = gt.join(oth, left_on="other", right_on="entity_id", how="semi")
         s1_all = pl.concat([gt["s1"], pairs["s1_id"]]).unique()
+    grids = {"threshold": np.round(np.arange(0.02, 0.99, 0.01), 2),
+             "entity": np.round(np.arange(-3.0, 3.01, 0.25), 2)}
     rows = []
-    for t in np.round(np.arange(0.05, 0.96, 0.05), 2):
-        r = macro_f05(decide(pairs, t), gt, s1_all)
-        rows.append({"t": t, **r})
+    for rule, grid in grids.items():
+        key = "shift" if rule == "entity" else "threshold"
+        for v in grid:
+            dec = {"rule": rule, key: float(v)}
+            rows.append({"rule": rule, "param": float(v),
+                         **macro_f05(apply_rule(pairs, dec), gt, s1_all)})
     res = pl.DataFrame(rows)
-    print(res.select("t", "macro_f05", "singleton_acc", "nonsingleton_f05", "pair_precision",
-                     "pair_recall"))
-    best = res.sort("macro_f05", descending=True).row(0, named=True)
-    print(f"best threshold {best['t']}: macro F0.5 = {best['macro_f05']:.4f} "
-          f"(entities: {best['n_entities']:,}, singletons: {best['n_singletons']:,})")
-    return float(best["t"])
+    cols = ["param", "macro_f05", "singleton_acc", "nonsingleton_f05", "pair_precision",
+            "pair_recall"]
+    best = {}
+    for rule in grids:
+        b = res.filter(pl.col("rule") == rule).sort("macro_f05", descending=True)
+        print(f"rule={rule}: top settings"); print(b.select(cols).head(5))
+        best[rule] = b.row(0, named=True)
+    win = max(best.values(), key=lambda r: r["macro_f05"])
+    print("  ".join(f"{r}: {b['macro_f05']:.4f}" for r, b in best.items())
+          + f"  -> using {win['rule']} (param {win['param']}; entities: {win['n_entities']:,}, "
+            f"singletons: {win['n_singletons']:,})")
+    return {"rule": win["rule"], "shift" if win["rule"] == "entity" else "threshold": win["param"]}
 
 
 def predict(pct: int = 100):
-    df = pl.read_parquet(feature_path("test", pct)) if feature_path("test", pct).exists() \
-        else build("test", pct)
+    df = load_features("test", pct)
     cols = feature_cols(df)
-    X = df.select(cols).to_numpy().astype(np.float32)
+    X = df.select(cols).cast(pl.Float32).to_numpy()
     p = np.mean([lgb.Booster(model_file=str(WORK_DIR / f"stage2_fold{f}.txt"))
                  .predict(X, num_threads=N_THREADS) for f in range(N_FOLDS)], axis=0)
-    t = json.load(open(WORK_DIR / "decision.json"))["threshold"]
+    with open(WORK_DIR / "decision.json") as fh:
+        dec = json.load(fh)
     pairs = df.select("s1_id", "other_id").with_columns(p=pl.Series(p, dtype=pl.Float32))
     pairs.write_parquet(WORK_DIR / "test_scores.parquet")
-    write_outputs(decide(pairs, t), df.select("s1_id", "other_id"))
+    print("decision:", dec)
+    write_outputs(apply_rule(pairs, dec), df.select("s1_id", "other_id"))
 
 
 def _write_lists(pairs: pl.DataFrame, s1_ids: pl.Series, col: str, path):

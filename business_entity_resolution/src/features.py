@@ -3,7 +3,9 @@
 Groups:
   retrieval  - the three blocking cosines and per-channel ranks
   name       - rapidfuzz similarities on core / full names, token Jaccard, DBA alt-name match
-  address    - token Jaccard / containment, fuzzy ratios, house-number agreement
+  address    - token Jaccard / containment, fuzzy ratios, house-number agreement / conflict
+  rarity     - IDF-weighted overlap (IDF from all Source 1 records): a shared rare token is strong
+               evidence for a match, a rare token on one side only is strong evidence against
   record     - lengths, empty address, Indic script, domain-as-name, source
   context    - how this pair compares with the other candidates of the same S2/S3 record
                and of the same S1 entity (each S2/S3 record belongs to at most one S1)
@@ -27,7 +29,8 @@ def _cp(a: list[str], b: list[str], scorer) -> np.ndarray:
 
 
 def _jacc(a: str, b: str) -> list[pl.Expr]:
-    A, B = pl.col(a).str.split(" "), pl.col(b).str.split(" ")
+    # extract_all (not split) so "" -> [] and two empty fields don't score as a perfect match
+    A, B = pl.col(a).str.extract_all(r"\S+"), pl.col(b).str.extract_all(r"\S+")
     inter = A.list.set_intersection(B).list.len()
     return [
         (inter / A.list.set_union(B).list.len().clip(1)).cast(pl.Float32),
@@ -36,8 +39,38 @@ def _jacc(a: str, b: str) -> list[pl.Expr]:
     ]
 
 
-def build_features(cand: pl.DataFrame, s1: pl.DataFrame, oth: pl.DataFrame) -> pl.DataFrame:
-    """cand: blocking output (other_id, s1_id, cos_*, rank_*). s1/oth: normalized sources."""
+def token_idf(texts: pl.Series) -> tuple[pl.Series, pl.Series, float]:
+    """(tokens, idf, idf of an unseen token) over space-separated documents."""
+    toks = texts.str.extract_all(r"\S+").list.unique().explode().drop_nulls().alias("tok")
+    vc = toks.value_counts(name="df")
+    n = texts.len()
+    idf = pl.Series(np.log((n + 1) / (vc["df"].to_numpy() + 1)) + 1, dtype=pl.Float32)
+    return vc["tok"], idf, float(np.log(n + 1) + 1)
+
+
+def _idf(a: str, b: str, idf) -> list[pl.Expr]:
+    keys, vals, unseen = idf
+
+    def w(lst: pl.Expr) -> pl.Expr:
+        return lst.list.eval(pl.element().replace_strict(keys, vals, default=unseen,
+                                                         return_dtype=pl.Float32))
+
+    A, B = pl.col(a).str.extract_all(r"\S+"), pl.col(b).str.extract_all(r"\S+")
+    inter = A.list.set_intersection(B)
+    return [
+        (w(inter).list.sum() / w(A.list.set_union(B)).list.sum().clip(1e-6)).cast(pl.Float32),
+        w(inter).list.max().fill_null(0.0),                        # rarest shared token
+        w(A.list.set_difference(B)).list.max().fill_null(0.0),     # rarest token only in S2/S3
+        w(B.list.set_difference(A)).list.max().fill_null(0.0),     # rarest token only in S1
+    ]
+
+
+def build_features(cand: pl.DataFrame, s1: pl.DataFrame, oth: pl.DataFrame,
+                   name_idf=None, addr_idf=None) -> pl.DataFrame:
+    """cand: blocking output (other_id, s1_id, cos_*, rank_*). s1/oth: normalized sources.
+    name_idf / addr_idf: token_idf() over all Source 1 names / addresses (default: over `s1`)."""
+    name_idf = name_idf or token_idf(s1["name_core"])
+    addr_idf = addr_idf or token_idf(s1["addr_norm"])
     df = (cand
           .join(oth.select(SIDE_COLS), left_on="other_id", right_on="entity_id")
           .join(s1.select(SIDE_COLS), left_on="s1_id", right_on="entity_id", suffix="_1"))
@@ -63,6 +96,10 @@ def build_features(cand: pl.DataFrame, s1: pl.DataFrame, oth: pl.DataFrame) -> p
     nj, nc_, ni = _jacc("name_core", "name_core_1")
     aj, ac, ai = _jacc("addr_norm", "addr_norm_1")
     mj, mc, mi = _jacc("addr_nums", "addr_nums_1")
+    nw = dict(zip(("n_idf_jacc", "n_idf_shared_max", "n_idf_only_o", "n_idf_only_s"),
+                  _idf("name_core", "name_core_1", name_idf)))
+    aw = dict(zip(("a_idf_jacc", "a_idf_shared_max", "a_idf_only_o", "a_idf_only_s"),
+                  _idf("addr_norm", "addr_norm_1", addr_idf)))
     first = pl.col("addr_nums").str.extract(r"^(\d+)")
     first1 = pl.col("addr_nums_1").str.extract(r"^(\d+)")
     raw = pl.col("business_name")
@@ -70,6 +107,10 @@ def build_features(cand: pl.DataFrame, s1: pl.DataFrame, oth: pl.DataFrame) -> p
         n_jacc=nj, n_contain=nc_, n_inter=ni,
         a_jacc=aj, a_contain=ac, a_inter=ai,
         num_jacc=mj, num_contain=mc, num_inter=mi,
+        # both addresses carry numbers and none agree (e.g. different house / plot numbers)
+        num_conflict=((pl.col("addr_nums") != "") & (pl.col("addr_nums_1") != "")
+                      & (mi == 0)).cast(pl.Int8),
+        **nw, **aw,
         num_first_eq=(first == first1).fill_null(False).cast(pl.Int8),
         num_first_prefix=((first.is_not_null() & first1.is_not_null())
                           & (first1.str.starts_with(first.fill_null("#"))

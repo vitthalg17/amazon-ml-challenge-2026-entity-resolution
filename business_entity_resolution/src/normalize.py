@@ -96,7 +96,8 @@ ADDR_ABBR = {
     "fort": "ft", "ftt": "ft",
     "nagar": "ngr", "colony": "col", "sector": "sec", "sect": "sec", "layout": "lyt",
     "extension": "extn", "ext": "extn", "phase": "ph", "block": "blk", "building": "bldg",
-    "apartment": "apt", "apartments": "apt", "apts": "apt", "floor": "flr", "fl": "flr",
+    # floor -> "fl" (not "flr") so the state code "FL" and "Florida" stay the same token
+    "apartment": "apt", "apartments": "apt", "apts": "apt", "floor": "fl", "flr": "fl",
     "opposite": "opp", "near": "nr", "behind": "bh", "district": "dist", "distt": "dist",
     "taluk": "tq", "taluka": "tq", "tehsil": "teh", "village": "vill", "vil": "vill",
     "post": "po", "industrial": "indl", "ind": "indl", "estate": "est", "complex": "cplx",
@@ -107,23 +108,38 @@ ADDR_ABBR = {
 }
 ADDR_DROP = {"null", "none", "na", "nan", "no", "ndeg", "number", "num", "nos", "h", "hn", "hno", "door",
              "dno", "box", "unit", "suite", "ste", "apt", "house", "shop", "flat", "at", "and",
-             "of", "the", "po", "pin", "pincode", "india", "usa", "us", "france", "bis", "ter"}
+             "of", "the", "po", "pin", "pincode", "india", "usa", "us", "france", "bis"}
 
 
-def _load_translit():
+def _load_translit() -> dict:
     if TRANSLIT_PATH.exists():
         with open(TRANSLIT_PATH, encoding="utf-8") as f:
-            d = json.load(f)
-        return d.get("name", {}), d.get("addr", {})
-    return {}, {}
+            return json.load(f)
+    return {}
 
 
-NAME_TL, ADDR_TL = _load_translit()
+_TL = _load_translit()
+NAME_TL, ADDR_TL = {}, {}
+
+
+def use_translit(fold: int | None = None):
+    """Select the full dictionary (fold=None) or the one learned without S1-fold `fold`."""
+    global NAME_TL, ADDR_TL
+    d = _TL if fold is None else _TL["folds"][fold]
+    NAME_TL, ADDR_TL = d.get("name", {}), d.get("addr", {})
+
+
+def n_translit_folds() -> int:
+    return len(_TL.get("folds", []))
 
 
 def reload_translit():
-    global NAME_TL, ADDR_TL
-    NAME_TL, ADDR_TL = _load_translit()
+    global _TL
+    _TL = _load_translit()
+    use_translit()
+
+
+use_translit()
 
 
 def ascii_key(tok: str) -> str:
@@ -197,7 +213,7 @@ def addr_exprs(col: str = "business_address") -> list[pl.Expr]:
     for k, v in {**US_STATES_MULTI, **IN_STATES_MULTI}.items():
         s = s.str.replace_all(rf"\b{k}\b", v)
     s = (s.str.replace_all(r"\b[cswd]\s*/\s*o\b", " ")             # c/o, s/o, w/o, d/o
-          .str.replace_all(r"(\d+)\s*(st|nd|rd|th)\b", "$1")      # 7th / 7nd / 7rd -> 7
+          .str.replace_all(r"(\d+)(st|nd|rd|th)\b", "$1")         # 7th / 7nd / 7rd -> 7 ("45 St" kept)
           .str.replace_all(r"(\d)([a-z])", "$1 $2")
           .str.replace_all(r"([a-z])(\d)", "$1 $2")
           .str.replace_all(r"[^a-z0-9]+", " ")

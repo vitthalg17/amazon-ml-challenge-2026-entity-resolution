@@ -3,7 +3,19 @@ import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-DATA_DIR = Path(os.environ.get("ER_DATA_DIR", ROOT / "student_resource" / "dataset"))
+PKG = Path(__file__).resolve().parents[1]  # business_entity_resolution/
+
+
+def _default_data_dir() -> Path:
+    # student_resource/ next to business_entity_resolution/ (preferred: keeps the data out of
+    # the code folder that gets zipped), or inside it
+    for base in (ROOT, PKG):
+        if (base / "student_resource" / "dataset").is_dir():
+            return base / "student_resource" / "dataset"
+    return ROOT / "student_resource" / "dataset"
+
+
+DATA_DIR = Path(os.environ.get("ER_DATA_DIR", _default_data_dir()))
 WORK_DIR = Path(os.environ.get("ER_WORK_DIR", ROOT / "work"))
 OUTPUT_DIR = Path(os.environ.get("ER_OUTPUT_DIR", ROOT / "output"))
 

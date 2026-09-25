@@ -4,8 +4,13 @@ A small LightGBM over retrieval signals only (channel cosines, ranks, gap to the
 candidate). It is trained on raw (unpruned) candidates of a training sample, then applied
 inside blocking: per S2/S3 record keep its top PRUNE_TOP candidates with p >= PRUNE_PMIN.
 The pruned set is what the matching model scores, i.e. candidate_pairs.tsv.
+
+Cross-fit: the raw sample is split in two hash halves and a model is trained on each. Train
+records in the first half are pruned by the second model and all other records by the first, so
+no training record's p1 (also a stage-2 feature) comes from a model that saw its label.
 """
 import argparse
+import json
 import os
 
 import lightgbm as lgb
@@ -14,7 +19,9 @@ import polars as pl
 
 from config import SEED, WORK_DIR
 
-MODEL_PATH = WORK_DIR / "stage1.txt"
+MODEL_PATH = WORK_DIR / "stage1.txt"      # trained on hash buckets [0, half)
+ALT_PATH = WORK_DIR / "stage1_alt.txt"    # trained on hash buckets [half, pct)
+META_PATH = WORK_DIR / "stage1.json"
 PRUNE_TOP = int(os.environ.get("ER_PRUNE_TOP", 10))
 PRUNE_PMIN = float(os.environ.get("ER_PRUNE_PMIN", 0.0005))
 N_THREADS = int(os.environ.get("ER_THREADS", os.cpu_count() or 4))
@@ -34,13 +41,22 @@ def feature_names(channels, rank_cols) -> list[str]:
 
 
 def load_model():
-    return lgb.Booster(model_file=str(MODEL_PATH)) if MODEL_PATH.exists() else None
+    if not MODEL_PATH.exists():
+        return None
+    half = json.loads(META_PATH.read_text())["half"] if META_PATH.exists() else 0
+    alt = lgb.Booster(model_file=str(ALT_PATH)) if half and ALT_PATH.exists() else None
+    return {"main": lgb.Booster(model_file=str(MODEL_PATH)), "alt": alt, "half": half}
 
 
-def prune(cand: pl.DataFrame, model, channels, rank_cols, key: str = "oi") -> pl.DataFrame:
+def prune(cand: pl.DataFrame, pruner: dict, channels, rank_cols, key: str = "oi",
+          in_main_sample: np.ndarray | None = None) -> pl.DataFrame:
+    """in_main_sample: per-row mask of records the main model was trained on (scored by alt)."""
     df = feature_frame(cand, channels, rank_cols, key)
-    X = df.select(feature_names(channels, rank_cols)).to_numpy().astype(np.float32)
-    df = df.with_columns(p1=pl.Series(model.predict(X, num_threads=N_THREADS), dtype=pl.Float32))
+    X = df.select(feature_names(channels, rank_cols)).cast(pl.Float32).to_numpy()
+    p = pruner["main"].predict(X, num_threads=N_THREADS)
+    if pruner["alt"] is not None and in_main_sample is not None and in_main_sample.any():
+        p[in_main_sample] = pruner["alt"].predict(X[in_main_sample], num_threads=N_THREADS)
+    df = df.with_columns(p1=pl.Series(p, dtype=pl.Float32))
     df = df.filter((pl.col("p1") >= PRUNE_PMIN)
                    & (pl.col("p1").rank("ordinal", descending=True).over(key) <= PRUNE_TOP))
     return df.select(cand.columns + ["p1"])
@@ -55,16 +71,25 @@ def train(pct: int):
                       left_on=["s1_id", "other_id"], right_on=["s1", "other"], how="left")
             .with_columns(pl.col("label").fill_null(0)))
     df = feature_frame(cand, CHANNELS, RANK_COLS, key="other_id")
-    X = df.select(feature_names(CHANNELS, RANK_COLS)).to_numpy().astype(np.float32)
+    X = df.select(feature_names(CHANNELS, RANK_COLS)).cast(pl.Float32).to_numpy()
     y = df["label"].to_numpy()
     params = dict(objective="binary", learning_rate=0.1, num_leaves=63, min_data_in_leaf=100,
                   feature_fraction=0.9, seed=SEED, verbose=-1, num_threads=N_THREADS)
-    model = lgb.train(params, lgb.Dataset(X, y), 200)
-    model.save_model(str(MODEL_PATH))
-    print(f"stage-1 trained on {len(y):,} raw candidate pairs ({y.sum():,} positive) -> {MODEL_PATH}")
+    half = pct // 2
+    first = (df["other_id"].hash(SEED) % 100 < half).to_numpy()
+    jobs = [(MODEL_PATH, first), (ALT_PATH, ~first)]
+    if not (half and first.any() and (~first).any()):
+        print("stage-1: sample too small to cross-fit, training a single model")
+        half, jobs = 0, [(MODEL_PATH, np.ones(len(y), bool))]
+        ALT_PATH.unlink(missing_ok=True)
+    for path, rows in jobs:
+        lgb.train(params, lgb.Dataset(X[rows], y[rows]), 200).save_model(str(path))
+        print(f"stage-1 trained on {rows.sum():,} raw candidate pairs ({y[rows].sum():,} positive)"
+              f" -> {path}")
+    META_PATH.write_text(json.dumps({"half": half, "pct": pct}))
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--pct", type=int, default=5, help="train sample the raw candidates came from")
+    ap.add_argument("--pct", type=int, default=6, help="train sample the raw candidates came from")
     train(ap.parse_args().pct)

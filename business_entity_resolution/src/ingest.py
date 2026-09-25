@@ -29,6 +29,7 @@ def main():
     pairs = (
         gt.with_columns(pl.col("matched_entity_ids").str.split(","))
         .explode("matched_entity_ids")
+        .with_columns(pl.col("matched_entity_ids").str.strip_chars())
         .filter(pl.col("matched_entity_ids").is_not_null() & (pl.col("matched_entity_ids") != ""))
         .rename({"source1_entity_id": "s1", "matched_entity_ids": "other"})
     )

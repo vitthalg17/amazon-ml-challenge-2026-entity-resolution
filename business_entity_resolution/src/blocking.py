@@ -20,7 +20,7 @@ import scipy.sparse as sp
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sparse_dot_topn import sp_matmul_topn
 
-from config import WORK_DIR
+from config import SEED, WORK_DIR
 import stage1
 from prep import load_norm
 
@@ -93,10 +93,14 @@ def exact_pairs(s1: pl.DataFrame, oth: pl.DataFrame) -> pl.DataFrame:
 
 
 def block_country(s1: pl.DataFrame, oth: pl.DataFrame, k: dict[str, int] | None = None,
-                  pruner=None, thresh: float = 0.05) -> pl.DataFrame:
+                  pruner=None, thresh: float = 0.05, cross_fit: bool = False) -> pl.DataFrame:
     """Candidates for one country. Processes S2/S3 records in chunks of CHUNK so memory stays
-    bounded; when `pruner` (stage-1 model) is given, each chunk is pruned before it is kept."""
+    bounded; when `pruner` (stage-1 model) is given, each chunk is pruned before it is kept.
+    cross_fit (train only): records the main pruner was trained on are pruned by the alt one."""
     t0 = time.time()
+    in_main = None
+    if pruner is not None and cross_fit and pruner["half"]:
+        in_main = (oth["entity_id"].hash(SEED) % 100 < pruner["half"]).to_numpy()
     max_df = max(MAX_DF_MIN, int(MAX_DF_FRAC * s1.height))
     t1, to = channel_texts(s1), channel_texts(oth)
     mats = {}
@@ -132,7 +136,8 @@ def block_country(s1: pl.DataFrame, oth: pl.DataFrame, k: dict[str, int] | None 
         )
         n_raw += cand.height
         if pruner is not None:
-            cand = stage1.prune(cand, pruner, CHANNELS, RANK_COLS, key="oi")
+            cand = stage1.prune(cand, pruner, CHANNELS, RANK_COLS, key="oi",
+                                in_main_sample=None if in_main is None else in_main[oi])
         out.append(cand)
     cand = pl.concat(out)
     cand = cand.with_columns(
@@ -162,7 +167,8 @@ def run(split: str, pct: int = 100, k: dict[str, int] | None = None, raw: bool =
         b = oth.filter(pl.col("country") == country)
         print(f"[{country}] S1={a.height:,} S2/S3={b.height:,}", flush=True)
         if a.height and b.height:
-            out.append(block_country(a, b, k, pruner).with_columns(country=pl.lit(country)))
+            out.append(block_country(a, b, k, pruner, cross_fit=split == "train")
+                       .with_columns(country=pl.lit(country)))
     # S2/S3 records whose country never appears in S1 cannot match anything.
     cand = pl.concat(out)
     cand.write_parquet(candidates_path(split, pct, raw))

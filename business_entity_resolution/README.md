@@ -1,7 +1,9 @@
 # Business Entity Resolution — Amazon ML Challenge 2026
 
 Two-stage pipeline: **blocking** (multi-channel TF-IDF retrieval + a stage-1 pruner) followed by
-a **LightGBM matching model** with a one-S1-per-record assignment and an F0.5-tuned threshold.
+a **LightGBM matching model** with a one-S1-per-record assignment and an F0.5-tuned decision
+rule (a global threshold, or a per-entity choice that maximizes expected F0.5, whichever scores
+higher out of fold).
 CPU only; no external data, APIs or pretrained models.
 
 ## Layout

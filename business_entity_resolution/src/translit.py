@@ -18,6 +18,7 @@ from config import SEED, WORK_DIR, pq_path
 from normalize import INDIC_RE, TRANSLIT_PATH, ascii_key
 
 TOK_RE = re.compile(r"[^a-z0-9]+")
+N_FOLDS = 4  # cross-fit folds over S1 entities (same hash as the stage-2 folds)
 
 
 def latin_tokens(s: str) -> list[str]:
@@ -46,7 +47,7 @@ def load_pairs(pct: int) -> pl.DataFrame:
     df = (others.join(pairs, left_on="entity_id", right_on="other")
           .join(pl.scan_parquet(pq_path("train", 1)), left_on="s1", right_on="entity_id",
                 suffix="_s1")
-          .select("business_name", "business_address", "business_name_s1",
+          .select("s1", "business_name", "business_address", "business_name_s1",
                   "business_address_s1")
           .collect())
     return df
@@ -58,7 +59,8 @@ def learn(df: pl.DataFrame, min_count: int = 2, min_share: float = 0.5):
     addr_tot: Counter = Counter()
     s1_df: Counter = Counter()
 
-    for n_o, a_o, n_1, a_1 in df.iter_rows():
+    for n_o, a_o, n_1, a_1 in df.select("business_name", "business_address", "business_name_s1",
+                                        "business_address_s1").iter_rows():
         if INDIC_RE.search(n_o):
             to, t1 = other_tokens(n_o), latin_tokens(n_1)
             if len(to) == len(t1):
@@ -90,20 +92,25 @@ def learn(df: pl.DataFrame, min_count: int = 2, min_share: float = 0.5):
     return name_map, addr_map
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--pct", type=int, default=100,
-                    help="percent of Source 2/3 records to learn from (hash sample)")
-    args = ap.parse_args()
-    df = load_pairs(args.pct)
+def build(pct: int = 100) -> dict:
+    """Learn the full dictionary (used for test) plus one per fold learned without that fold's
+    S1 entities (used to normalize train, so train similarities aren't inflated by labels)."""
+    df = load_pairs(pct)
     print("pairs with Indic text:", df.height)
     name_map, addr_map = learn(df)
-    print("name entries:", len(name_map), "addr entries:", len(addr_map))
+    fold = df["s1"].hash(SEED) % N_FOLDS
+    folds = [dict(zip(("name", "addr"), learn(df.filter(fold != f)))) for f in range(N_FOLDS)]
+    d = {"name": name_map, "addr": addr_map, "folds": folds}
     with open(TRANSLIT_PATH, "w", encoding="utf-8") as f:
-        json.dump({"name": name_map, "addr": addr_map}, f, ensure_ascii=False)
-    for m in (name_map, addr_map):
-        print(list(m.items())[:25])
+        json.dump(d, f, ensure_ascii=False)
+    print(f"translit: {len(name_map)} name / {len(addr_map)} address entries, {N_FOLDS} folds")
+    return d
 
 
 if __name__ == "__main__":
-    main()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--pct", type=int, default=100,
+                    help="percent of Source 2/3 records to learn from (hash sample)")
+    d = build(ap.parse_args().pct)
+    for m in (d["name"], d["addr"]):
+        print(list(m.items())[:25])

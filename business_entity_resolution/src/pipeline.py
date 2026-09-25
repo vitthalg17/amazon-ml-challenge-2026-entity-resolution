@@ -42,12 +42,8 @@ def run_step(step: str, pct: int, stage1_pct: int):
     elif step == "translit":
         import normalize
         import translit
-        name_map, addr_map = translit.learn(translit.load_pairs(min(pct, 100)))
-        import json
-        with open(translit.TRANSLIT_PATH, "w", encoding="utf-8") as f:
-            json.dump({"name": name_map, "addr": addr_map}, f, ensure_ascii=False)
+        translit.build(min(pct, 100))
         normalize.reload_translit()
-        print(f"translit: {len(name_map)} name / {len(addr_map)} address entries")
     elif step in ("prep_train", "prep_test"):
         prep.prep(step.split("_")[1], pct)
     elif step == "stage1_data":
@@ -77,8 +73,8 @@ def run_step(step: str, pct: int, stage1_pct: int):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     ap.add_argument("--pct", type=int, default=100, help="%% of Source 2/3 to use (smoke tests)")
-    ap.add_argument("--stage1-pct", type=int, default=3,
-                    help="%% of train Source 2/3 used to train the stage-1 pruner")
+    ap.add_argument("--stage1-pct", type=int, default=6,
+                    help="%% of train Source 2/3 used to train the two cross-fitted stage-1 pruners")
     ap.add_argument("--steps", nargs="+", default=STEPS, choices=STEPS)
     a = ap.parse_args()
     for step in [s for s in STEPS if s in a.steps]:

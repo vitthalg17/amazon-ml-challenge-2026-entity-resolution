@@ -16,6 +16,8 @@ assigned only to its highest-probability S1. Two rules then decide what to keep:
 import argparse
 import json
 import os
+import subprocess
+import sys
 import time
 
 import lightgbm as lgb
@@ -36,40 +38,100 @@ PARAMS = dict(objective="binary", learning_rate=0.05, num_leaves=127, min_data_i
 N_ROUNDS = int(os.environ.get("ER_ROUNDS", 600))
 
 
-def feature_path(split: str, pct: int):
-    return WORK_DIR / f"{split}_features{'' if pct >= 100 else f'_p{pct}'}.parquet"
+PAIRS_PER_PART = int(os.environ.get("ER_FEATURE_PART", 400_000))  # memory knob
 
 
-def load_features(split: str, pct: int) -> pl.DataFrame:
-    """Cached features, rebuilt when the candidates were regenerated after the cache was written."""
-    fp, cp = feature_path(split, pct), candidates_path(split, pct)
-    if fp.exists() and fp.stat().st_mtime >= cp.stat().st_mtime:
-        return pl.read_parquet(fp)
-    return build(split, pct)
+def feature_dir(split: str, pct: int):
+    return WORK_DIR / f"{split}_features{'' if pct >= 100 else f'_p{pct}'}"
 
 
-def build(split: str, pct: int) -> pl.DataFrame:
+def _parts(split: str, pct: int) -> list:
+    d = feature_dir(split, pct)
+    return sorted(d.glob("part_*.parquet")) if (d / "_DONE").exists() else []
+
+
+def _features_fresh(split: str, pct: int) -> bool:
+    d = feature_dir(split, pct)
+    return (d / "_DONE").exists() and         (d / "_DONE").stat().st_mtime >= candidates_path(split, pct).stat().st_mtime
+
+
+def build(split: str, pct: int) -> None:
+    """Features in parts of ~PAIRS_PER_PART pairs, so peak memory stays a few GB even for the
+    ~13M test pairs: pair features chunk by chunk (only that chunk's S2/S3 rows are loaded), then
+    context features over all pairs from a slim numeric table, then joined back part by part.
+    Output: <work>/<split>_features[_pN]/part_*.parquet (+ _DONE marker)."""
     t = time.time()
-    cand = pl.read_parquet(candidates_path(split, pct))
-    s1_all = load_norm(split, 1, 100)
-    idf = features.token_idf(s1_all["name_core"]), features.token_idf(s1_all["addr_norm"])
-    s1 = s1_all.join(cand.select(pl.col("s1_id").unique()), left_on="entity_id",
-                     right_on="s1_id", how="semi")
-    del s1_all
-    # read only the S2/S3 rows that are candidates (lazy semi-join: never the full sources)
-    ids = cand.lazy().select(pl.col("other_id").unique())
-    oth = pl.concat([load_norm(split, s, pct, lazy=True)
-                     .join(ids, left_on="entity_id", right_on="other_id", how="semi").collect()
-                     for s in (2, 3)])
-    df = features.build_features(cand, s1, oth, *idf)
+    d = feature_dir(split, pct)
+    d.mkdir(parents=True, exist_ok=True)
+    for f in d.glob("*"):
+        f.unlink()
+    cp = candidates_path(split, pct)
+    n_parts = max(1, -(-pl.scan_parquet(cp).select(pl.len()).collect().item() // PAIRS_PER_PART))
+    # Every part runs in its own short-lived process: the libraries do not hand freed memory
+    # back to the OS within one process, so a long loop grows by ~1 GB per part.
+    for i in range(n_parts):
+        _child("feature-part", split, pct, i, n_parts)
+    ctx = features.context_features(pl.scan_parquet(sorted(d.glob("ctxbase_*.parquet"))))
+    ctx.write_parquet(d / "ctx.parquet")
+    del ctx
+    for i in range(n_parts):
+        _child("ctx-join", split, pct, i, n_parts)
+    for f in [*d.glob("ctxbase_*.parquet"), d / "ctx.parquet"]:
+        f.unlink()
+    (d / "_DONE").touch()
+    n_cols = len(pl.read_parquet_schema(d / "part_000.parquet"))
+    print(f"{split}: {n_parts} parts, {n_cols} columns in {time.time() - t:.0f}s")
+
+
+def _child(cmd: str, split: str, pct: int, i: int, n_parts: int):
+    rc = subprocess.call([sys.executable, "-u", __file__, cmd, "--split", split, "--pct", str(pct),
+                          "--part", str(i), "--nparts", str(n_parts)])
+    if rc:
+        raise SystemExit(f"{cmd} part {i} failed (exit code {rc})")
+
+
+def feature_part(split: str, pct: int, i: int, n_parts: int):
+    """Pair features for part i (the S2/S3 records whose id hashes to i), plus its slim
+    context-base table. Each input is streamed with a plain row filter, so only this part's
+    rows are ever in memory."""
+    d = feature_dir(split, pct)
+
+    def in_part(col: str) -> pl.Expr:
+        return pl.col(col).hash(SEED) % n_parts == i
+
+    s1 = load_norm(split, 1, 100, columns=features.SIDE_COLS)  # 1.7-2.2M rows x 7 short columns
+    idf = features.token_idf(s1["name_core"]), features.token_idf(s1["addr_norm"])
+    c = pl.scan_parquet(candidates_path(split, pct)).filter(in_part("other_id")).collect(
+        engine="streaming")
+    oth = pl.concat([load_norm(split, s, pct, columns=features.SIDE_COLS, lazy=True)
+                     .filter(in_part("entity_id")).collect(engine="streaming") for s in (2, 3)])
+    df = features.pair_features(c, s1, oth, *idf)
+    del oth, c, s1
     if split == "train":
-        gt = pl.read_parquet(WORK_DIR / "train_gt_pairs.parquet")
-        df = (df.join(gt.with_columns(label=pl.lit(1, pl.Int8)), left_on=["s1_id", "other_id"],
-                      right_on=["s1", "other"], how="left")
+        gt = (pl.scan_parquet(WORK_DIR / "train_gt_pairs.parquet").filter(in_part("other"))
+              .with_columns(label=pl.lit(1, pl.Int8)).collect(engine="streaming"))
+        df = (df.join(gt, left_on=["s1_id", "other_id"], right_on=["s1", "other"], how="left")
               .with_columns(pl.col("label").fill_null(0)))
-    df.write_parquet(feature_path(split, pct))
-    print(f"{split}: {df.height:,} pairs x {len(features.FEATURES)} features in {time.time() - t:.0f}s")
-    return df
+    df.write_parquet(d / f"part_{i:03d}.parquet")
+    features.context_base(df).with_columns(_p=pl.lit(i, pl.Int32)).write_parquet(
+        d / f"ctxbase_{i:03d}.parquet")
+    print(f"    part {i + 1}/{n_parts}: {df.height:,} pairs", flush=True)
+
+
+def ctx_join(split: str, pct: int, i: int):
+    d = feature_dir(split, pct)
+    ctx = (pl.scan_parquet(d / "ctx.parquet").filter(pl.col("_p") == i).drop("_p")
+           .collect(engine="streaming"))
+    part = pl.read_parquet(d / f"part_{i:03d}.parquet")
+    part = features.with_keys(part).join(ctx, on=features.KEYS, how="left").drop(features.KEYS)
+    part.write_parquet(d / f"part_{i:03d}.parquet")
+
+
+def load_features(split: str, pct: int, columns=None) -> pl.DataFrame:
+    """All feature parts in one frame (train: a few M pairs). Rebuilt if the candidates are newer."""
+    if not _features_fresh(split, pct):
+        build(split, pct)
+    return pl.concat([pl.read_parquet(f, columns=columns) for f in _parts(split, pct)])
 
 
 FEATURES_PATH = WORK_DIR / "stage2_features.json"
@@ -193,18 +255,25 @@ def evaluate(pairs: pl.DataFrame, pct: int, rules=("threshold", "entity")) -> di
 
 
 def predict(pct: int = 100):
-    df = load_features("test", pct)
+    """Scores the test feature parts one at a time (the full test feature matrix never exists)."""
+    if not _features_fresh("test", pct):
+        build("test", pct)
     with open(FEATURES_PATH) as fh:
         cols = json.load(fh)  # exactly the features the fold models were trained on
-    X = df.select(cols).cast(pl.Float32).to_numpy()
-    p = np.mean([lgb.Booster(model_file=str(WORK_DIR / f"stage2_fold{f}.txt"))
-                 .predict(X, num_threads=N_THREADS) for f in range(N_FOLDS)], axis=0)
+    models = [lgb.Booster(model_file=str(WORK_DIR / f"stage2_fold{f}.txt")) for f in range(N_FOLDS)]
+    scored = []
+    for f in _parts("test", pct):
+        df = pl.read_parquet(f, columns=["s1_id", "other_id", *cols])
+        X = df.select(cols).cast(pl.Float32).to_numpy()
+        p = np.mean([m.predict(X, num_threads=N_THREADS) for m in models], axis=0)
+        scored.append(df.select("s1_id", "other_id").with_columns(p=pl.Series(p, dtype=pl.Float32)))
+        del df, X
+    pairs = pl.concat(scored)
     with open(WORK_DIR / "decision.json") as fh:
         dec = json.load(fh)
-    pairs = df.select("s1_id", "other_id").with_columns(p=pl.Series(p, dtype=pl.Float32))
     pairs.write_parquet(WORK_DIR / "test_scores.parquet")
     print("decision:", dec)
-    write_outputs(apply_rule(pairs, dec), df.select("s1_id", "other_id"))
+    write_outputs(apply_rule(pairs, dec), pairs.select("s1_id", "other_id"))
 
 
 def _write_lists(pairs: pl.DataFrame, s1_ids: pl.Series, col: str, path):
@@ -225,13 +294,19 @@ def write_outputs(matches: pl.DataFrame, cands: pl.DataFrame):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["features", "train", "predict"])
+    ap.add_argument("cmd", choices=["features", "train", "predict", "feature-part", "ctx-join"])
+    ap.add_argument("--part", type=int, default=0, help=argparse.SUPPRESS)
+    ap.add_argument("--nparts", type=int, default=1, help=argparse.SUPPRESS)
     ap.add_argument("--split", default="train", choices=["train", "test"])
     ap.add_argument("--pct", type=int, default=100)
     ap.add_argument("--test-pct", type=int, default=None, help="train only: %% test will use")
     a = ap.parse_args()
     if a.cmd == "features":
         build(a.split, a.pct)
+    elif a.cmd == "feature-part":
+        feature_part(a.split, a.pct, a.part, a.nparts)
+    elif a.cmd == "ctx-join":
+        ctx_join(a.split, a.pct, a.part)
     elif a.cmd == "train":
         train(a.pct, density_matched=(a.test_pct or a.pct) == a.pct)
     else:

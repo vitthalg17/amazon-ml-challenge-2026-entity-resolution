@@ -65,10 +65,60 @@ def _idf(a: str, b: str, idf) -> list[pl.Expr]:
     ]
 
 
+CTX_BASE = ("cos_name_word", "cos_name_char", "cos_addr", "cos_combo", "cos_sum", "p1",
+            "n_tset", "a_tset")
+
+
 def build_features(cand: pl.DataFrame, s1: pl.DataFrame, oth: pl.DataFrame,
                    name_idf=None, addr_idf=None) -> pl.DataFrame:
     """cand: blocking output (other_id, s1_id, cos_*, rank_*). s1/oth: normalized sources.
     name_idf / addr_idf: token_idf() over all Source 1 names / addresses (default: over `s1`)."""
+    df = pair_features(cand, s1, oth, name_idf, addr_idf)
+    df = with_keys(df).join(context_features(context_base(df)), on=KEYS).drop(KEYS)
+    FEATURES[:] = [c for c in df.columns if c not in ("other_id", "s1_id", "country", "label")]
+    return df
+
+
+KEYS = ["_o", "_s"]  # 64-bit hashes of other_id / s1_id: cheap group keys for the context step
+
+
+def with_keys(df: pl.DataFrame) -> pl.DataFrame:
+    return df.with_columns(_o=pl.col("other_id").hash(), _s=pl.col("s1_id").hash())
+
+
+def context_base(df: pl.DataFrame) -> pl.DataFrame:
+    """The slim table context_features needs: hashed ids + CTX_BASE (~48 bytes per pair)."""
+    return df.select(_o=pl.col("other_id").hash(), _s=pl.col("s1_id").hash(), *CTX_BASE)
+
+
+def context_features(base: pl.DataFrame | pl.LazyFrame) -> pl.DataFrame:
+    """Per-pair comparison with the other candidates of the same S2/S3 record (_o) and S1
+    entity (_s). Needs every candidate of those groups at once, but only the slim context_base
+    table, so it runs over all candidate pairs even when pair features were built in chunks.
+    Returns KEYS + context columns."""
+    df = base.lazy()
+    ctx = []
+    for c in CTX_BASE:
+        ctx += [
+            (pl.col(c).max().over("_o") - pl.col(c)).alias(f"{c}_gap_o"),
+            (pl.col(c).max().over("_s") - pl.col(c)).alias(f"{c}_gap_s"),
+        ]
+    ctx += [
+        pl.col("cos_sum").rank("ordinal", descending=True).over("_o").cast(pl.Int16).alias("rank_o"),
+        pl.col("cos_sum").rank("ordinal", descending=True).over("_s").cast(pl.Int16).alias("rank_s"),
+        pl.len().over("_o").cast(pl.Int16).alias("ncand_o"),
+        pl.len().over("_s").cast(pl.Int16).alias("ncand_s"),
+        # second-best competitor margin for the S2/S3 record
+        (pl.col("cos_sum") - pl.col("cos_sum").sort(descending=True).slice(1, 1).first()
+         .over("_o")).fill_null(1.0).alias("cos_sum_margin2_o"),
+    ]
+    passthrough = [c for c in ("_p",) if c in df.collect_schema().names()]  # part id, if any
+    return df.select(*KEYS, *passthrough, *ctx).collect()
+
+
+def pair_features(cand: pl.DataFrame, s1: pl.DataFrame, oth: pl.DataFrame,
+                  name_idf=None, addr_idf=None) -> pl.DataFrame:
+    """All features that depend on one (S2/S3, S1) pair only; safe to compute in chunks."""
     name_idf = name_idf or token_idf(s1["name_core"])
     addr_idf = addr_idf or token_idf(s1["addr_norm"])
     df = (cand
@@ -132,27 +182,6 @@ def build_features(cand: pl.DataFrame, s1: pl.DataFrame, oth: pl.DataFrame,
         src3=pl.col("other_id").str.starts_with("S3-").cast(pl.Int8),
     )
 
-    # context: compare with the other candidates of the same S2/S3 record / same S1 entity
     df = df.with_columns(cos_sum=pl.sum_horizontal(pl.col("^cos_.*$")))
-    ctx = []
-    for c in ("cos_name_word", "cos_name_char", "cos_addr", "cos_combo", "cos_sum", "p1",
-              "n_tset", "a_tset"):
-        ctx += [
-            (pl.col(c).max().over("other_id") - pl.col(c)).alias(f"{c}_gap_o"),
-            (pl.col(c).max().over("s1_id") - pl.col(c)).alias(f"{c}_gap_s"),
-        ]
-    ctx += [
-        pl.col("cos_sum").rank("ordinal", descending=True).over("other_id").cast(pl.Int16).alias("rank_o"),
-        pl.col("cos_sum").rank("ordinal", descending=True).over("s1_id").cast(pl.Int16).alias("rank_s"),
-        pl.len().over("other_id").cast(pl.Int16).alias("ncand_o"),
-        pl.len().over("s1_id").cast(pl.Int16).alias("ncand_s"),
-        # second-best competitor margin for the S2/S3 record
-        (pl.col("cos_sum") - pl.col("cos_sum").sort(descending=True).slice(1, 1).first()
-         .over("other_id")).fill_null(1.0).alias("cos_sum_margin2_o"),
-    ]
-    df = df.with_columns(ctx)
-
     drop = [c for c in df.columns if c in SIDE_COLS or c.endswith("_1") and c[:-2] in SIDE_COLS]
-    df = df.drop([c for c in drop if c != "entity_id"], strict=False)
-    FEATURES[:] = [c for c in df.columns if c not in ("other_id", "s1_id", "country", "label")]
-    return df
+    return df.drop([c for c in drop if c != "entity_id"], strict=False)

@@ -8,6 +8,7 @@ unmatched records, whose own id) hashes to fold f uses the transliteration dicti
 without fold f, so train features look like test features (dictionary never saw the pair).
 """
 import argparse
+import os
 import re
 import time
 
@@ -15,6 +16,8 @@ import polars as pl
 
 from config import SEED, WORK_DIR, pq_path
 from normalize import n_translit_folds, normalize, use_translit
+
+PREP_SLICE = int(os.environ.get("ER_PREP_SLICE", 1_000_000))  # rows normalized at a time
 
 
 def norm_path(split: str, source: int, pct: int = 100):
@@ -74,12 +77,22 @@ def prep(split: str, pct: int = 100):
         lf = pl.scan_parquet(pq_path(split, s))
         if s > 1 and pct < 100:
             lf = lf.filter(pl.col("entity_id").hash(SEED) % 100 < pct)
-        if split == "train" and n_folds:
-            df = _normalize_crossfit(lf, s, n_folds)
-        else:
-            df = normalize(lf).collect()
-        df.write_parquet(norm_path(split, s, pct if s > 1 else 100))
-        print(f"{split} s{s}: {df.height:,} rows normalized in {time.time() - t:.0f}s")
+        # normalize in row slices written as parts, then stream them into one file: peak memory
+        # is one slice, not the whole source (test sources have ~5M rows)
+        out = norm_path(split, s, pct if s > 1 else 100)
+        n = lf.select(pl.len()).collect().item()
+        parts = []
+        for i, off in enumerate(range(0, max(n, 1), PREP_SLICE)):
+            sl = lf.slice(off, PREP_SLICE)
+            df = (_normalize_crossfit(sl, s, n_folds) if split == "train" and n_folds
+                  else normalize(sl).collect())
+            parts.append(out.with_name(f"{out.stem}.part{i:02d}.parquet"))
+            df.write_parquet(parts[-1])
+            del df
+        pl.scan_parquet(parts).sink_parquet(out)
+        for f in parts:
+            f.unlink()
+        print(f"{split} s{s}: {n:,} rows normalized in {time.time() - t:.0f}s", flush=True)
 
 
 if __name__ == "__main__":

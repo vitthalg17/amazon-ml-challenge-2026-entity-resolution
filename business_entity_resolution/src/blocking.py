@@ -13,6 +13,7 @@ every candidate pair and reused as model features.
 import argparse
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import polars as pl
@@ -34,8 +35,11 @@ _COMMON = dict(sublinear_tf=True, dtype=np.float32, lowercase=False)
 CHANNEL_SPECS = {
     "name_word": dict(k=10, vec=lambda: TfidfVectorizer(token_pattern=r"\S+", ngram_range=(1, 2),
                                                          min_df=1, **_COMMON)),
-    "name_char": dict(k=10, vec=lambda: TfidfVectorizer(analyzer="char_wb", ngram_range=(4, 4),
-                                                         min_df=1, **_COMMON)),
+    # char 4-grams have long posting lists: a tighter df cap halves top-K time at -0.08pp recall
+    # (measured on a 2% train sample)
+    "name_char": dict(k=10, max_df_frac=float(os.environ.get("ER_NAME_CHAR_MAX_DF_FRAC", 0.002)),
+                      vec=lambda: TfidfVectorizer(analyzer="char_wb", ngram_range=(4, 4),
+                                                  min_df=1, **_COMMON)),
     "addr": dict(k=10, vec=lambda: TfidfVectorizer(token_pattern=r"\S+", ngram_range=(1, 2),
                                                     min_df=2, **_COMMON)),
     "combo": dict(k=10, vec=lambda: TfidfVectorizer(token_pattern=r"\S+", ngram_range=(1, 1),
@@ -64,9 +68,13 @@ def channel_texts(df: pl.DataFrame) -> dict[str, list[str]]:
             "addr": t["addr"].to_list(), "combo": t["combo"].to_list()}
 
 
+COSINE_STEP = int(os.environ.get("ER_COSINE_STEP", 200_000))
+
+
 def row_cosine(A: sp.csr_matrix, B: sp.csr_matrix, ia: np.ndarray, ib: np.ndarray,
-               step: int = 2_000_000) -> np.ndarray:
-    """cos(A[ia[k]], B[ib[k]]) for all k (rows are already L2-normalised)."""
+               step: int = COSINE_STEP) -> np.ndarray:
+    """cos(A[ia[k]], B[ib[k]]) for all k (rows are already L2-normalised). Rows are gathered
+    `step` pairs at a time; this runs for 4 channels in parallel, so keep `step` modest."""
     out = np.empty(len(ia), dtype=np.float32)
     for s in range(0, len(ia), step):
         e = s + step
@@ -75,8 +83,8 @@ def row_cosine(A: sp.csr_matrix, B: sp.csr_matrix, ia: np.ndarray, ib: np.ndarra
 
 
 def topk_pairs(Q: sp.csr_matrix, BT: sp.csr_matrix, k: int, thresh: float, col: str,
-               offset: int) -> pl.DataFrame:
-    C = sp_matmul_topn(Q, BT, top_n=k, threshold=thresh, sort=True, n_threads=N_THREADS)
+               offset: int, n_threads: int = N_THREADS) -> pl.DataFrame:
+    C = sp_matmul_topn(Q, BT, top_n=k, threshold=thresh, sort=True, n_threads=n_threads)
     counts = np.diff(C.indptr)
     rows = np.repeat(np.arange(C.shape[0], dtype=np.int32), counts)
     rank = np.arange(len(rows)) - np.repeat(C.indptr[:-1], counts)
@@ -95,52 +103,58 @@ def exact_pairs(s1: pl.DataFrame, oth: pl.DataFrame) -> pl.DataFrame:
 def block_country(s1: pl.DataFrame, oth: pl.DataFrame, k: dict[str, int] | None = None,
                   pruner=None, thresh: float = 0.05, cross_fit: bool = False) -> pl.DataFrame:
     """Candidates for one country. Processes S2/S3 records in chunks of CHUNK so memory stays
-    bounded; when `pruner` (stage-1 model) is given, each chunk is pruned before it is kept.
+    bounded (queries are vectorized per chunk); when `pruner` (stage-1 model) is given, each chunk
+    is pruned before it is kept.
     cross_fit (train only): records the main pruner was trained on are pruned by the alt one."""
     t0 = time.time()
     in_main = None
     if pruner is not None and cross_fit and pruner["half"]:
         in_main = (oth["entity_id"].hash(SEED) % 100 < pruner["half"]).to_numpy()
-    max_df = max(MAX_DF_MIN, int(MAX_DF_FRAC * s1.height))
-    t1, to = channel_texts(s1), channel_texts(oth)
-    mats = {}
+    t1 = channel_texts(s1)
+    fitted = {}
     for ch, spec in CHANNEL_SPECS.items():
         vec = spec["vec"]()
         A = vec.fit_transform(t1[ch]).tocsr()
-        Q = vec.transform(to[ch]).tocsr()
         BT = A.T.tocsr()
         # Retrieval cost is the sum of posting-list lengths of each query's features, so very
         # common features (" sh", "rd", "mh") are dropped from the *query* side for retrieval
         # only. They carry little IDF weight; full vectors are kept for the cosines.
+        max_df = max(MAX_DF_MIN, int(spec.get("max_df_frac", MAX_DF_FRAC) * s1.height))
         keep = sp.diags((np.diff(BT.indptr) <= max_df).astype(np.float32))
-        mats[ch] = (Q, A, BT, keep)  # mask applied per chunk: no second copy of every Q
-        t1[ch] = to[ch] = None
-    del t1, to
+        fitted[ch] = (vec, A, BT, keep)
+        t1[ch] = None
+    del t1
     print(f"    vectorized in {time.time() - t0:.0f}s", flush=True)
 
     exact = exact_pairs(s1, oth)
     out, n_raw = [], 0
-    for s in range(0, oth.height, CHUNK):
-        e = min(s + CHUNK, oth.height)
-        parts = [exact.filter(pl.col("oi").is_between(s, e - 1))]
-        for ch, (Q, A, BT, keep) in mats.items():
-            Qr = Q[s:e] @ keep
-            Qr.eliminate_zeros()
-            parts.append(topk_pairs(Qr, BT, (k or {}).get(ch, CHANNEL_SPECS[ch]["k"]),
-                                    thresh, f"rank_{ch}", s))
-        cand = (pl.concat(parts, how="diagonal")
-                .group_by("oi", "si")
-                .agg(*[pl.col(c).min() for c in RANK_COLS]))
-        oi, si = cand["oi"].to_numpy(), cand["si"].to_numpy()
-        cand = cand.with_columns(
-            **{f"cos_{ch}": pl.Series(row_cosine(Q, A, oi, si)) for ch, (Q, A, _, _) in mats.items()},
-            **{c: pl.col(c).fill_null(99) for c in RANK_COLS},
-        )
-        n_raw += cand.height
-        if pruner is not None:
-            cand = stage1.prune(cand, pruner, CHANNELS, RANK_COLS, key="oi",
-                                in_main_sample=None if in_main is None else in_main[oi])
-        out.append(cand)
+    with ThreadPoolExecutor(len(fitted)) as pool:  # per-channel cosines run in parallel
+        for s in range(0, oth.height, CHUNK):
+            e = min(s + CHUNK, oth.height)
+            parts = [exact.filter(pl.col("oi").is_between(s, e - 1))]
+            to = channel_texts(oth.slice(s, e - s))  # query texts per chunk: bounded memory
+            qs = {}
+            for ch, (vec, A, BT, keep) in fitted.items():
+                Q = qs[ch] = vec.transform(to[ch]).tocsr()
+                Qr = Q @ keep
+                Qr.eliminate_zeros()
+                parts.append(topk_pairs(Qr, BT, (k or {}).get(ch, CHANNEL_SPECS[ch]["k"]),
+                                        thresh, f"rank_{ch}", s))
+            cand = (pl.concat(parts, how="diagonal")
+                    .group_by("oi", "si")
+                    .agg(*[pl.col(c).min() for c in RANK_COLS]))
+            oi, si = cand["oi"].to_numpy(), cand["si"].to_numpy()
+            cos = dict(zip(fitted, pool.map(
+                lambda ch: row_cosine(qs[ch], fitted[ch][1], oi - s, si), list(fitted))))
+            cand = cand.with_columns(
+                **{f"cos_{ch}": pl.Series(v) for ch, v in cos.items()},
+                **{c: pl.col(c).fill_null(99) for c in RANK_COLS},
+            )
+            n_raw += cand.height
+            if pruner is not None:
+                cand = stage1.prune(cand, pruner, CHANNELS, RANK_COLS, key="oi",
+                                    in_main_sample=None if in_main is None else in_main[oi])
+            out.append(cand)
     cand = pl.concat(out)
     cand = cand.with_columns(
         other_id=oth["entity_id"].gather(cand["oi"]),
@@ -164,12 +178,15 @@ def run(split: str, pct: int = 100, k: dict[str, int] | None = None, raw: bool =
     pruner = None if raw else stage1.load_model()
     if not raw and pruner is None:
         raise SystemExit("stage-1 model missing: run blocking --raw on a train sample, then stage1.py")
-    s1 = load_norm(split, 1, 100, columns=BLOCK_COLS)
-    oth = pl.concat([load_norm(split, s, pct, columns=BLOCK_COLS) for s in (2, 3)])
+    countries = sorted(load_norm(split, 1, 100, columns=["country"], lazy=True)
+                       .select(pl.col("country").unique()).collect()["country"].to_list())
     out = []
-    for country in sorted(s1["country"].unique().to_list()):
-        a = s1.filter(pl.col("country") == country)
-        b = oth.filter(pl.col("country") == country)
+    for country in countries:
+        # one country in memory at a time
+        a = load_norm(split, 1, 100, columns=BLOCK_COLS, lazy=True).filter(
+            pl.col("country") == country).collect()
+        b = pl.concat([load_norm(split, s, pct, columns=BLOCK_COLS, lazy=True)
+                       .filter(pl.col("country") == country).collect() for s in (2, 3)])
         print(f"[{country}] S1={a.height:,} S2/S3={b.height:,}", flush=True)
         if a.height and b.height:
             out.append(block_country(a, b, k, pruner, cross_fit=split == "train")

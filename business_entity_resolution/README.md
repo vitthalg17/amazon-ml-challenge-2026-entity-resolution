@@ -55,6 +55,15 @@ decision rule are switched off, because they depend on how many S2/S3 records we
 python pipeline.py --train-pct 30
 ```
 
+On a 16 GB laptop (the configuration that produced leaderboard 0.9545): every step and every
+feature part runs in its own process, and `tools/run_guarded.py` (repo root) adds low CPU
+priority plus a watchdog that stops the job if available RAM drops below the limit:
+
+```bash
+ER_THREADS=16 ER_STAGE1_PCT=2 python ../../tools/run_guarded.py --min-avail-mb 2000 \
+    --log run.log -- python -u pipeline.py --train-pct 30
+```
+
 Resume from any step, e.g. after changing the model only:
 
 ```bash

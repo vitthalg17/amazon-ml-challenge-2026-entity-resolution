@@ -49,13 +49,13 @@ def load_model():
 
 
 def prune(cand: pl.DataFrame, pruner: dict, channels, rank_cols, key: str = "oi",
-          in_main_sample: np.ndarray | None = None) -> pl.DataFrame:
+          in_main_sample: np.ndarray | None = None, n_threads: int = N_THREADS) -> pl.DataFrame:
     """in_main_sample: per-row mask of records the main model was trained on (scored by alt)."""
     df = feature_frame(cand, channels, rank_cols, key)
     X = df.select(feature_names(channels, rank_cols)).cast(pl.Float32).to_numpy()
-    p = pruner["main"].predict(X, num_threads=N_THREADS)
+    p = pruner["main"].predict(X, num_threads=n_threads)
     if pruner["alt"] is not None and in_main_sample is not None and in_main_sample.any():
-        p[in_main_sample] = pruner["alt"].predict(X[in_main_sample], num_threads=N_THREADS)
+        p[in_main_sample] = pruner["alt"].predict(X[in_main_sample], num_threads=n_threads)
     df = df.with_columns(p1=pl.Series(p, dtype=pl.Float32))
     df = df.filter((pl.col("p1") >= PRUNE_PMIN)
                    & (pl.col("p1").rank("ordinal", descending=True).over(key) <= PRUNE_TOP))

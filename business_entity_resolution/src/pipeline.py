@@ -19,6 +19,7 @@ Steps (in order):
   validate             run the official validator on the outputs
 """
 import argparse
+import os
 import subprocess
 import sys
 import time
@@ -86,17 +87,27 @@ def main():
                          "on small machines. Keep test at 100 for a real submission.")
     ap.add_argument("--test-pct", type=int, default=None,
                     help="%% of test Source 2/3 (overrides --pct for test)")
-    ap.add_argument("--stage1-pct", type=int, default=6,
+    ap.add_argument("--stage1-pct", type=int, default=int(os.environ.get("ER_STAGE1_PCT", 6)),
                     help="%% of train Source 2/3 used to train the two cross-fitted stage-1 pruners")
     ap.add_argument("--steps", nargs="+", default=STEPS, choices=STEPS)
+    ap.add_argument("--one-step", action="store_true", help=argparse.SUPPRESS)
     a = ap.parse_args()
     train_pct = a.train_pct if a.train_pct is not None else a.pct
     test_pct = a.test_pct if a.test_pct is not None else a.pct
+    steps = [s for s in STEPS if s in a.steps]
+    if a.one_step:  # child process: run exactly one step in-process
+        run_step(steps[0], train_pct, test_pct, a.stage1_pct)
+        return
     print(f"train_pct={train_pct} test_pct={test_pct} stage1_pct={a.stage1_pct}", flush=True)
-    for step in [s for s in STEPS if s in a.steps]:
+    for step in steps:
         t = time.time()
         print(f"\n===== {step} =====", flush=True)
-        run_step(step, train_pct, test_pct, a.stage1_pct)
+        # every step in a fresh process: memory from earlier steps is fully returned to the OS
+        rc = subprocess.call([sys.executable, "-u", __file__, "--one-step", "--steps", step,
+                              "--train-pct", str(train_pct), "--test-pct", str(test_pct),
+                              "--stage1-pct", str(a.stage1_pct)])
+        if rc:
+            raise SystemExit(f"step {step} failed (exit code {rc})")
         print(f"===== {step} done in {time.time() - t:.0f}s", flush=True)
 
 

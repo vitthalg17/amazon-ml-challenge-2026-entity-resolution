@@ -8,3 +8,6 @@ work_smoke/
 output_smoke/
 *.log
 *.pdf
+logs/
+archive/
+*.watchdog

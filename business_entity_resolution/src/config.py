@@ -2,6 +2,8 @@
 import os
 from pathlib import Path
 
+import _compat  # noqa: F401  (must run before scipy/sklearn are imported anywhere)
+
 ROOT = Path(__file__).resolve().parents[2]
 PKG = Path(__file__).resolve().parents[1]  # business_entity_resolution/
 

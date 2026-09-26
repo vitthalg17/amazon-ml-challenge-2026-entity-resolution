@@ -339,33 +339,36 @@ def train(pct: int, density_matched: bool = True, fit_pct: int = 100):
     X = np.lib.format.open_memmap(WORK_DIR / "train_X.npy", mode="w+", dtype=np.float32,
                                   shape=(n, len(cols)))
     y = np.empty(n, dtype=np.int8)
-    ids, off = [], 0
+    fold = np.empty(n, dtype=np.int8)
+    # early stopping on S1 entities outside the OOF fold; a different 10% slice per fold, so no
+    # row is excluded from fitting by every fold model
+    es_group = np.empty(n, dtype=np.int8)
+    off = 0
     for f, c in zip(parts, counts):
-        df = (pl.scan_parquet(f).filter(flt).select("s1_id", "other_id", "label", *cols)
+        df = (pl.scan_parquet(f).filter(flt).select("s1_id", "label", *cols)
               .collect(engine="streaming"))
         X[off:off + c] = df.select(cols).cast(pl.Float32).to_numpy()
         y[off:off + c] = df["label"].to_numpy()
-        ids.append(df.select("s1_id", "other_id"))
+        fold[off:off + c] = (df["s1_id"].hash(SEED) % N_FOLDS).to_numpy()
+        es_group[off:off + c] = (df["s1_id"].hash(SEED + 1) % 10).to_numpy()
         off += c
         del df
-    ids = pl.concat(ids)
     X.flush()
     print(f"fitting on {n:,} pairs x {len(cols)} features (fit_pct={fit_pct})", flush=True)
-    fold = (ids["s1_id"].hash(SEED) % N_FOLDS).to_numpy()
-    # early stopping on S1 entities outside the OOF fold; a different 10% slice per fold, so no
-    # row is excluded from fitting by every fold model
-    es_group = (ids["s1_id"].hash(SEED + 1) % 10).to_numpy()
     full = lgb.Dataset(X, y, feature_name=cols, free_raw_data=True,
                        params={"max_bin": 255, "verbose": -1, "force_row_wise": True,
                                "num_threads": N_THREADS,
                                # dense bins (1 byte/value, 0.5 GB): the sparse ones are built
                                # through per-thread push buffers that spike by several GB
                                "enable_sparse": False}).construct()
-    # LightGBM only needs its binned copy now: close the matrix (~1.2 GB less per million rows
-    # in total) and read each fold's rows back from disk for the out-of-fold predictions
+    # LightGBM only needs its binned copy now: close and delete the matrix (the out-of-fold
+    # predictions read the rows back from the feature parts, part by part)
     del X
-    X = np.load(WORK_DIR / "train_X.npy", mmap_mode="r")
-    oof = np.zeros(n, dtype=np.float32)
+    try:
+        (WORK_DIR / "train_X.npy").unlink()
+    except OSError:
+        pass
+    models = []
     for f in range(N_FOLDS):
         t = time.time()
         va = fold == f
@@ -374,19 +377,28 @@ def train(pct: int, density_matched: bool = True, fit_pct: int = 100):
         m = lgb.train(PARAMS, full.subset(np.flatnonzero(tr)), N_ROUNDS,
                       valid_sets=[full.subset(np.flatnonzero(es))],
                       callbacks=[lgb.early_stopping(100, verbose=False)])
-        oof[va] = m.predict(X[va], num_threads=N_THREADS)
         m.save_model(str(WORK_DIR / f"stage2_fold{f}.txt"))
+        models.append(m)
         print(f"fold {f}: best_iter={m.best_iteration} ({time.time() - t:.0f}s)", flush=True)
     imp = sorted(zip(m.feature_importance("gain"), cols), reverse=True)
     print("top features:", [(c, round(g / 1e3)) for g, c in imp[:25]])
-    del X, full
-    try:
-        (WORK_DIR / "train_X.npy").unlink()
-    except OSError:
-        pass
+    del full
 
-    pairs = ids.with_columns(p=pl.Series(oof))
-    pairs.write_parquet(WORK_DIR / f"train_oof{'' if pct >= 100 else f'_p{pct}'}.parquet")
+    out = []
+    for f in parts:  # out-of-fold: each fitted row scored by the model that never saw its S1
+        df = (pl.scan_parquet(f).filter(flt).select("s1_id", "other_id", *cols)
+              .collect(engine="streaming"))
+        Xp = df.select(cols).cast(pl.Float32).to_numpy()
+        fp = (df["s1_id"].hash(SEED) % N_FOLDS).to_numpy()
+        pr = np.zeros(len(df), dtype=np.float32)
+        for k, mk in enumerate(models):
+            sel = fp == k
+            if sel.any():
+                pr[sel] = mk.predict(Xp[sel], num_threads=N_THREADS)
+        out.append(df.select("s1_id", "other_id").with_columns(p=pl.Series(pr)))
+        del df, Xp
+    pl.concat(out).write_parquet(
+        WORK_DIR / f"train_oof{'' if pct >= 100 else f'_p{pct}'}.parquet")
 
 
 def scores_path(split: str, stage: int):

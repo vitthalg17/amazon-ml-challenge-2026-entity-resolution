@@ -21,7 +21,7 @@ import scipy.sparse as sp
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sparse_dot_topn import sp_matmul_topn
 
-from config import SEED, WORK_DIR
+from config import SEED, WORK_DIR, pq_path
 import stage1
 from prep import load_norm
 
@@ -30,23 +30,29 @@ CHUNK = int(os.environ.get("ER_BLOCK_CHUNK", 300_000))
 MAX_DF_FRAC = float(os.environ.get("ER_MAX_DF_FRAC", 0.01))  # retrieval-side feature df cap
 MAX_DF_MIN = 2000
 EXACT_MAX_GROUP = int(os.environ.get("ER_EXACT_MAX_GROUP", 50))
+# names shared by more S1 entities than that ("Pediatric National Medicine", "Bordeaux Club"):
+# every S1 with the name is scored by address similarity and the best EXACT_ADDR_K are kept
+EXACT_BIG_MAX = int(os.environ.get("ER_EXACT_BIG_MAX", 3000))
+EXACT_ADDR_K = int(os.environ.get("ER_EXACT_ADDR_K", 5))
+_u = os.environ.get("ER_UNSEEN_PMIN")
+UNSEEN_PMIN = float(_u) if _u else None  # stage-1 floor for countries absent from training
 
 _COMMON = dict(sublinear_tf=True, dtype=np.float32, lowercase=False)
 CHANNEL_SPECS = {
-    "name_word": dict(k=10, vec=lambda: TfidfVectorizer(token_pattern=r"\S+", ngram_range=(1, 2),
+    "name_word": dict(k=20, vec=lambda: TfidfVectorizer(token_pattern=r"\S+", ngram_range=(1, 2),
                                                          min_df=1, **_COMMON)),
     # char 4-grams have long posting lists: a tighter df cap halves top-K time at -0.08pp recall
     # (measured on a 2% train sample)
     "name_char": dict(k=10, max_df_frac=float(os.environ.get("ER_NAME_CHAR_MAX_DF_FRAC", 0.002)),
                       vec=lambda: TfidfVectorizer(analyzer="char_wb", ngram_range=(4, 4),
                                                   min_df=1, **_COMMON)),
-    "addr": dict(k=10, vec=lambda: TfidfVectorizer(token_pattern=r"\S+", ngram_range=(1, 2),
+    "addr": dict(k=20, vec=lambda: TfidfVectorizer(token_pattern=r"\S+", ngram_range=(1, 2),
                                                     min_df=2, **_COMMON)),
-    "combo": dict(k=10, vec=lambda: TfidfVectorizer(token_pattern=r"\S+", ngram_range=(1, 1),
+    "combo": dict(k=20, vec=lambda: TfidfVectorizer(token_pattern=r"\S+", ngram_range=(1, 1),
                                                      min_df=1, **_COMMON)),
 }
 CHANNELS = tuple(CHANNEL_SPECS)
-RANK_COLS = [f"rank_{c}" for c in CHANNELS] + ["rank_exact"]
+RANK_COLS = [f"rank_{c}" for c in CHANNELS] + ["rank_exact", "rank_exact_addr"]
 
 
 def name_key_expr() -> pl.Expr:
@@ -100,8 +106,35 @@ def exact_pairs(s1: pl.DataFrame, oth: pl.DataFrame) -> pl.DataFrame:
             .with_columns(rank_exact=pl.lit(0, dtype=pl.Int8)))
 
 
+def exact_addr_pairs(keys: pl.DataFrame, big: pl.DataFrame, Q: sp.csr_matrix, A: sp.csr_matrix,
+                     offset: int, max_pairs: int = 1_000_000) -> pl.DataFrame:
+    """For S2/S3 records whose name key is shared by many S1 entities (big: key, si), score every
+    S1 with that name by address cosine and keep the best EXACT_ADDR_K. Q holds this chunk's
+    address vectors (row = oi - offset), A all S1 address vectors.
+    Records are processed in batches whose joined pairs stay under max_pairs, and each batch is
+    cut to its top EXACT_ADDR_K per record straight away: common Indian names ("X Traders") have
+    hundreds of S1 entities each, and joining a whole chunk at once needed several GB."""
+    empty = pl.DataFrame(schema={"oi": pl.Int32, "si": pl.Int32, "rank_exact_addr": pl.Int8})
+    if keys.height == 0:
+        return empty
+    k = keys.join(big.group_by("key").agg(n=pl.len()), on="key")
+    k = k.with_columns(batch=((pl.col("n").cum_sum() - 1) // max_pairs))
+    out = []
+    for (_,), kb in k.group_by("batch", maintain_order=True):
+        part = kb.select("oi", "key").join(big, on="key").select("oi", "si")
+        oi, si = part["oi"].to_numpy(), part["si"].to_numpy()
+        part = part.with_columns(c=pl.Series(row_cosine(Q, A, oi - offset, si))).filter(pl.col("c") > 0)
+        out.append(part.with_columns(r=pl.col("c").rank("ordinal", descending=True).over("oi") - 1)
+                   .filter(pl.col("r") < EXACT_ADDR_K))  # before the Int8 cast: groups > 127
+    if not out:
+        return empty
+    return pl.concat(out).select(pl.col("oi").cast(pl.Int32), pl.col("si").cast(pl.Int32),
+                                 rank_exact_addr=pl.col("r").cast(pl.Int8))
+
+
 def block_country(s1: pl.DataFrame, oth: pl.DataFrame, k: dict[str, int] | None = None,
-                  pruner=None, thresh: float = 0.05, cross_fit: bool = False) -> pl.DataFrame:
+                  pruner=None, thresh: float = 0.05, cross_fit: bool = False,
+                  prune_pmin: float | None = None) -> pl.DataFrame:
     """Candidates for one country. Processes S2/S3 records in chunks of CHUNK so memory stays
     bounded (queries are vectorized per chunk); when `pruner` (stage-1 model) is given, each chunk
     is pruned before it is kept.
@@ -127,6 +160,11 @@ def block_country(s1: pl.DataFrame, oth: pl.DataFrame, k: dict[str, int] | None 
     print(f"    vectorized in {time.time() - t0:.0f}s", flush=True)
 
     exact = exact_pairs(s1, oth)
+    s1_keys = s1.select(key=name_key_expr()).with_row_index("si").with_columns(
+        pl.col("si").cast(pl.Int32))
+    big = s1_keys.filter(pl.len().over("key").is_between(EXACT_MAX_GROUP + 1, EXACT_BIG_MAX))
+    oth_keys = oth.select(key=name_key_expr()).with_row_index("oi").with_columns(
+        pl.col("oi").cast(pl.Int32)).join(big.select("key").unique(), on="key", how="semi")
     out, n_raw = [], 0
     with ThreadPoolExecutor(len(fitted)) as pool:  # per-channel cosines run in parallel
         for s in range(0, oth.height, CHUNK):
@@ -140,6 +178,8 @@ def block_country(s1: pl.DataFrame, oth: pl.DataFrame, k: dict[str, int] | None 
                 Qr.eliminate_zeros()
                 parts.append(topk_pairs(Qr, BT, (k or {}).get(ch, CHANNEL_SPECS[ch]["k"]),
                                         thresh, f"rank_{ch}", s))
+            parts.append(exact_addr_pairs(oth_keys.filter(pl.col("oi").is_between(s, e - 1)),
+                                          big, qs["addr"], fitted["addr"][1], s))
             cand = (pl.concat(parts, how="diagonal")
                     .group_by("oi", "si")
                     .agg(*[pl.col(c).min() for c in RANK_COLS]))
@@ -153,7 +193,8 @@ def block_country(s1: pl.DataFrame, oth: pl.DataFrame, k: dict[str, int] | None 
             n_raw += cand.height
             if pruner is not None:
                 cand = stage1.prune(cand, pruner, CHANNELS, RANK_COLS, key="oi",
-                                    in_main_sample=None if in_main is None else in_main[oi])
+                                    in_main_sample=None if in_main is None else in_main[oi],
+                                    pmin=prune_pmin)
             out.append(cand)
     cand = pl.concat(out)
     cand = cand.with_columns(
@@ -180,6 +221,11 @@ def run(split: str, pct: int = 100, k: dict[str, int] | None = None, raw: bool =
         raise SystemExit("stage-1 model missing: run blocking --raw on a train sample, then stage1.py")
     countries = sorted(load_norm(split, 1, 100, columns=["country"], lazy=True)
                        .select(pl.col("country").unique()).collect()["country"].to_list())
+    # countries absent from training (France): same pruning rule by default. Keeping the top 10
+    # regardless of probability (ER_UNSEEN_PMIN=0) gave France ~10 candidates per record vs
+    # ~1.5 in training, which shifts the stage-2 context features (ncand, gaps, ranks)
+    seen = set(pl.scan_parquet(pq_path("train", 1)).select(pl.col("country").unique())
+               .collect()["country"].to_list())
     out = []
     for country in countries:
         # one country in memory at a time
@@ -189,7 +235,8 @@ def run(split: str, pct: int = 100, k: dict[str, int] | None = None, raw: bool =
                        .filter(pl.col("country") == country).collect() for s in (2, 3)])
         print(f"[{country}] S1={a.height:,} S2/S3={b.height:,}", flush=True)
         if a.height and b.height:
-            out.append(block_country(a, b, k, pruner, cross_fit=split == "train")
+            out.append(block_country(a, b, k, pruner, cross_fit=split == "train",
+                                     prune_pmin=UNSEEN_PMIN if country not in seen else None)
                        .with_columns(country=pl.lit(country)))
     # S2/S3 records whose country never appears in S1 cannot match anything.
     cand = pl.concat(out)

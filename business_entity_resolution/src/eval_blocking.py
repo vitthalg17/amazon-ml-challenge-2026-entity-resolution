@@ -21,7 +21,7 @@ def evaluate(pct: int = 100, raw: bool = False, ks=(1, 2, 3, 5, 10)):
     print(f"candidate pairs: {cand.height:,} ({cand.height / n_oth:.1f} per S2/S3 record)")
 
     hit = gt.join(cand, left_on=["s1", "other"], right_on=["s1_id", "other_id"], how="left")
-    chans = list(CHANNELS) + ["exact"]
+    chans = list(CHANNELS) + ["exact", "exact_addr"]
     rows = []
     for k in ks:
         flags = {ch: (pl.col(f"rank_{ch}") < k).fill_null(False) for ch in chans}

@@ -18,17 +18,32 @@ import os
 import numpy as np
 import polars as pl
 from rapidfuzz import fuzz, process
-from rapidfuzz.distance import JaroWinkler
+from rapidfuzz.distance import JaroWinkler, Levenshtein
 
 N_WORKERS = int(os.environ.get("ER_THREADS", os.cpu_count() or 4))
 SIDE_COLS = ["entity_id", "business_name", "name_norm", "name_core", "name_alt",
-             "addr_norm", "addr_nums", "name_loc", "street"]
+             "addr_norm", "addr_nums", "name_loc", "street", "house"]
 
 FEATURES: list[str] = []  # filled by build_features (order used by the model)
 
 
 def _cp(a: list[str], b: list[str], scorer) -> np.ndarray:
     return process.cpdist(a, b, scorer=scorer, workers=N_WORKERS, dtype=np.float32)
+
+
+LEGAL_ABBR = {"pvt": "private", "prv": "private", "ltd": "limited", "inc": "incorporated",
+              "corp": "corporation", "co": "company", "pvtltd": "private"}
+LEGAL_WORDS = ["private", "limited", "incorporated", "corporation", "company", "llc", "llp", "lp",
+               "plc", "pllc", "pc", "pa", "public", "sarl", "sas", "sasu", "sa", "eurl", "sci",
+               "snc", "scp", "selarl", "gmbh", "ag"]
+
+
+def _legal_tokens(col: str) -> pl.Expr:
+    """Legal-form words of the raw name ("L.L.C." -> llc, "Pvt" -> private)."""
+    return (pl.col(col).str.to_lowercase().str.replace_all(r"\.", "")
+            .str.extract_all(r"[a-z0-9]+")
+            .list.eval(pl.element().replace(LEGAL_ABBR))
+            .list.eval(pl.element().filter(pl.element().is_in(LEGAL_WORDS))).list.unique())
 
 
 def _jacc(a: str, b: str) -> list[pl.Expr]:
@@ -213,6 +228,39 @@ def pair_features(cand: pl.DataFrame, s1: pl.DataFrame, oth: pl.DataFrame,
         name_upper=(raw == raw.str.to_uppercase()).cast(pl.Int8),
         has_alt=(pl.col("name_alt") != "").cast(pl.Int8),
         src3=pl.col("other_id").str.starts_with("S3-").cast(pl.Int8),
+    )
+
+    # legal form: noise abbreviates or drops it, distractors swap it. On uncertain train pairs a
+    # different legal type is a match 16% of the time vs 65% for the same type, and S1 "Limited"
+    # vs record "Private Limited" is never one. Counted as words added / dropped by the S2/S3
+    # record, so the same features apply to legal forms never seen in training (SARL vs SAS).
+    lo, ls = _legal_tokens("business_name"), _legal_tokens("business_name_1")
+    added, dropped = lo.list.set_difference(ls).list.len(), ls.list.set_difference(lo).list.len()
+    df = df.with_columns(
+        lg_n_o=lo.list.len().cast(pl.Int8), lg_n_s=ls.list.len().cast(pl.Int8),
+        lg_added=added.cast(pl.Int8), lg_dropped=dropped.cast(pl.Int8),
+        lg_conflict=((added > 0) & (dropped > 0)).cast(pl.Int8),
+    )
+    # house number: edit distance between the first numbers (noise often changes one digit)
+    f_o = df.select(first.fill_null(""))[:, 0].to_list()
+    f_s = df.select(first1.fill_null(""))[:, 0].to_list()
+    lev = process.cpdist(f_o, f_s, scorer=Levenshtein.distance, workers=N_WORKERS, dtype=np.int32)
+    df = df.with_columns(num_first_lev=pl.when(first.is_not_null() & first1.is_not_null())
+                         .then(pl.Series(lev, dtype=pl.Int16)),
+                         num_first_lendiff=(first.str.len_chars().cast(pl.Int16)
+                                            - first1.str.len_chars().cast(pl.Int16)))
+    # house number of the street segment (robust to reordered address parts)
+    h, h1 = pl.col("house"), pl.col("house_1")
+    both = (h != "") & (h1 != "")
+    hlev = process.cpdist(df["house"].to_list(), df["house_1"].to_list(),
+                          scorer=Levenshtein.distance, workers=N_WORKERS, dtype=np.int32)
+    df = df.with_columns(
+        house_eq=pl.when(both).then((h == h1).cast(pl.Int8)),
+        house_lev=pl.when(both).then(pl.Series(hlev, dtype=pl.Int16)),
+        house_prefix=pl.when(both).then((h.str.starts_with(h1) | h1.str.starts_with(h)).cast(pl.Int8)),
+        house_in_nums=pl.when(h1 != "").then(                    # S1 house anywhere in the record
+            pl.col("addr_nums").str.extract_all(r"\d+").list.contains(h1).cast(pl.Int8)),
+        house_missing=((h == "").cast(pl.Int8) + 2 * (h1 == "").cast(pl.Int8)),
     )
 
     df = df.with_columns(cos_sum=pl.sum_horizontal(pl.col("^cos_.*$")))

@@ -23,7 +23,7 @@ MODEL_PATH = WORK_DIR / "stage1.txt"      # trained on hash buckets [0, half)
 ALT_PATH = WORK_DIR / "stage1_alt.txt"    # trained on hash buckets [half, pct)
 META_PATH = WORK_DIR / "stage1.json"
 PRUNE_TOP = int(os.environ.get("ER_PRUNE_TOP", 10))
-PRUNE_PMIN = float(os.environ.get("ER_PRUNE_PMIN", 0.0005))
+PRUNE_PMIN = float(os.environ.get("ER_PRUNE_PMIN", 0.0001))  # was 0.0005: dropped ~0.3% of true pairs
 N_THREADS = int(os.environ.get("ER_THREADS", os.cpu_count() or 4))
 
 
@@ -49,15 +49,17 @@ def load_model():
 
 
 def prune(cand: pl.DataFrame, pruner: dict, channels, rank_cols, key: str = "oi",
-          in_main_sample: np.ndarray | None = None, n_threads: int = N_THREADS) -> pl.DataFrame:
-    """in_main_sample: per-row mask of records the main model was trained on (scored by alt)."""
+          in_main_sample: np.ndarray | None = None, n_threads: int = N_THREADS,
+          pmin: float | None = None) -> pl.DataFrame:
+    """in_main_sample: per-row mask of records the main model was trained on (scored by alt).
+    pmin: probability floor (default PRUNE_PMIN); 0 keeps the top PRUNE_TOP regardless."""
     df = feature_frame(cand, channels, rank_cols, key)
     X = df.select(feature_names(channels, rank_cols)).cast(pl.Float32).to_numpy()
     p = pruner["main"].predict(X, num_threads=n_threads)
     if pruner["alt"] is not None and in_main_sample is not None and in_main_sample.any():
         p[in_main_sample] = pruner["alt"].predict(X[in_main_sample], num_threads=n_threads)
     df = df.with_columns(p1=pl.Series(p, dtype=pl.Float32))
-    df = df.filter((pl.col("p1") >= PRUNE_PMIN)
+    df = df.filter((pl.col("p1") >= (PRUNE_PMIN if pmin is None else pmin))
                    & (pl.col("p1").rank("ordinal", descending=True).over(key) <= PRUNE_TOP))
     return df.select(cand.columns + ["p1"])
 

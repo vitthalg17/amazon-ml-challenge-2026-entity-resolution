@@ -34,6 +34,8 @@ EXACT_MAX_GROUP = int(os.environ.get("ER_EXACT_MAX_GROUP", 50))
 # every S1 with the name is scored by address similarity and the best EXACT_ADDR_K are kept
 EXACT_BIG_MAX = int(os.environ.get("ER_EXACT_BIG_MAX", 3000))
 EXACT_ADDR_K = int(os.environ.get("ER_EXACT_ADDR_K", 5))
+_u = os.environ.get("ER_UNSEEN_PMIN")
+UNSEEN_PMIN = float(_u) if _u else None  # stage-1 floor for countries absent from training
 
 _COMMON = dict(sublinear_tf=True, dtype=np.float32, lowercase=False)
 CHANNEL_SPECS = {
@@ -118,10 +120,10 @@ def exact_addr_pairs(keys: pl.DataFrame, big: pl.DataFrame, Q: sp.csr_matrix, A:
     if not out:
         return pl.DataFrame(schema={"oi": pl.Int32, "si": pl.Int32, "rank_exact_addr": pl.Int8})
     j = pl.concat(out).filter(pl.col("c") > 0)
-    return (j.with_columns(rank_exact_addr=(pl.col("c").rank("ordinal", descending=True)
-                                            .over("oi") - 1).cast(pl.Int8))
-            .filter(pl.col("rank_exact_addr") < EXACT_ADDR_K)
-            .select(pl.col("oi").cast(pl.Int32), pl.col("si").cast(pl.Int32), "rank_exact_addr"))
+    return (j.with_columns(r=pl.col("c").rank("ordinal", descending=True).over("oi") - 1)
+            .filter(pl.col("r") < EXACT_ADDR_K)  # before the Int8 cast: groups can exceed 127
+            .select(pl.col("oi").cast(pl.Int32), pl.col("si").cast(pl.Int32),
+                    rank_exact_addr=pl.col("r").cast(pl.Int8)))
 
 
 def block_country(s1: pl.DataFrame, oth: pl.DataFrame, k: dict[str, int] | None = None,
@@ -213,8 +215,9 @@ def run(split: str, pct: int = 100, k: dict[str, int] | None = None, raw: bool =
         raise SystemExit("stage-1 model missing: run blocking --raw on a train sample, then stage1.py")
     countries = sorted(load_norm(split, 1, 100, columns=["country"], lazy=True)
                        .select(pl.col("country").unique()).collect()["country"].to_list())
-    # countries absent from training (France): the pruner never saw them, so keep its top
-    # PRUNE_TOP candidates regardless of probability and let stage 2 (+ guards) decide
+    # countries absent from training (France): same pruning rule by default. Keeping the top 10
+    # regardless of probability (ER_UNSEEN_PMIN=0) gave France ~10 candidates per record vs
+    # ~1.5 in training, which shifts the stage-2 context features (ncand, gaps, ranks)
     seen = set(pl.scan_parquet(pq_path("train", 1)).select(pl.col("country").unique())
                .collect()["country"].to_list())
     out = []
@@ -227,7 +230,7 @@ def run(split: str, pct: int = 100, k: dict[str, int] | None = None, raw: bool =
         print(f"[{country}] S1={a.height:,} S2/S3={b.height:,}", flush=True)
         if a.height and b.height:
             out.append(block_country(a, b, k, pruner, cross_fit=split == "train",
-                                     prune_pmin=0.0 if country not in seen else None)
+                                     prune_pmin=UNSEEN_PMIN if country not in seen else None)
                        .with_columns(country=pl.lit(country)))
     # S2/S3 records whose country never appears in S1 cannot match anything.
     cand = pl.concat(out)

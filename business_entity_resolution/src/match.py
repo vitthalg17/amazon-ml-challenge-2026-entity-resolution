@@ -33,7 +33,7 @@ import polars as pl
 
 import features
 from blocking import candidates_path
-from config import OUTPUT_DIR, SEED, WORK_DIR
+from config import OUTPUT_DIR, SEED, WORK_DIR, pq_path
 from metrics import macro_f05
 from prep import load_norm
 
@@ -440,16 +440,38 @@ def calibrate(pct: int, density_matched: bool = True, fit_pct: int = 100):
         print(f"== stage {stage}: calibrating on {pairs.height:,} held-out pairs", flush=True)
         results[stage] = evaluate(pairs, pct, rules=rules)
         del pairs
-    best = max(results, key=lambda st: results[st]["macro_f05"])
+    best = max(results, key=lambda st: results[st]["macro_f05_w"])
     dec = {**results[best], "stage": best}
-    print("stage scores:", {st: round(r["macro_f05"], 5) for st, r in results.items()},
+    print("stage scores (test mix / train mix):",
+          {st: (round(r["macro_f05_w"], 5), round(r["macro_f05"], 5)) for st, r in results.items()},
           "-> using", dec, flush=True)
     with open(WORK_DIR / "decision.json", "w") as fh:
         json.dump(dec, fh)
 
 
+def distractor_weight() -> float:
+    """How many times more distractor records (records matching no S1 entity) test has per S1
+    entity than train. Test has the same number of true matches per entity as train (its
+    predicted matches per entity and its share of entities without matches agree with train),
+    but more S2/S3 records per entity: the surplus is distractors. Only row counts of the
+    competition files are used. Override with ER_DISTRACTOR_W (1 = train mix)."""
+    if os.environ.get("ER_DISTRACTOR_W"):
+        return float(os.environ["ER_DISTRACTOR_W"])
+    n = {sp: [pl.scan_parquet(pq_path(sp, s)).select(pl.len()).collect().item() for s in (1, 2, 3)]
+         for sp in ("train", "test")}
+    true_per_s1 = (pl.scan_parquet(WORK_DIR / "train_gt_pairs.parquet").select(pl.len())
+                   .collect().item() / n["train"][0])
+    d_train = (n["train"][1] + n["train"][2]) / n["train"][0] - true_per_s1
+    d_test = (n["test"][1] + n["test"][2]) / n["test"][0] - true_per_s1
+    return max(1.0, d_test / d_train)
+
+
 def evaluate(pairs: pl.DataFrame, pct: int, rules=("threshold", "entity")) -> dict:
-    """Grid-search both decision rules on OOF probabilities; returns the best as a decision dict."""
+    """Grid-search both decision rules on held-out probabilities; returns the best as a decision
+    dict. Selection uses macro_f05_w: the metric re-weighted to test's distractor density (see
+    distractor_weight / metrics.macro_f05); plain macro_f05 is reported next to it."""
+    w = distractor_weight()
+    print(f"distractor weight (test / train distractors per entity): {w:.3f}", flush=True)
     gt = pl.read_parquet(WORK_DIR / "train_gt_pairs.parquet")
     s1_all = load_norm("train", 1, 100, columns=["entity_id"])["entity_id"]
     pairs = pairs.with_columns(pl.col("p").cast(pl.Float32))
@@ -473,21 +495,24 @@ def evaluate(pairs: pl.DataFrame, pct: int, rules=("threshold", "entity")) -> di
         for v in grid:
             dec = {"rule": rule, key: float(v)}
             rows.append({"rule": rule, "param": float(v),
-                         **macro_f05(apply_rule(pairs, dec), gt, s1_all)})
+                         **macro_f05(apply_rule(pairs, dec), gt, s1_all, distractor_w=w)})
     res = pl.DataFrame(rows)
-    cols = ["param", "macro_f05", "singleton_acc", "nonsingleton_f05", "pair_precision",
-            "pair_recall"]
+    cols = ["param", "macro_f05_w", "macro_f05", "singleton_acc", "nonsingleton_f05",
+            "pair_precision", "pair_recall"]
     best = {}
     for rule in grids:
-        b = res.filter(pl.col("rule") == rule).sort("macro_f05", descending=True)
+        b = res.filter(pl.col("rule") == rule).sort("macro_f05_w", descending=True)
         print(f"rule={rule}: top settings"); print(b.select(cols).head(5))
+        u = res.filter(pl.col("rule") == rule).sort("macro_f05", descending=True).row(0, named=True)
+        print(f"  (best on the train mix: param {u['param']}, macro_f05 {u['macro_f05']:.5f})")
         best[rule] = b.row(0, named=True)
-    win = max(best.values(), key=lambda r: r["macro_f05"])
-    print("  ".join(f"{r}: {b['macro_f05']:.4f}" for r, b in best.items())
+    win = max(best.values(), key=lambda r: r["macro_f05_w"])
+    print("  ".join(f"{r}: {b['macro_f05_w']:.4f}" for r, b in best.items())
           + f"  -> using {win['rule']} (param {win['param']}; entities: {win['n_entities']:,}, "
             f"singletons: {win['n_singletons']:,})")
     return {"rule": win["rule"], "shift" if win["rule"] == "entity" else "threshold": win["param"],
-            "macro_f05": win["macro_f05"]}
+            "macro_f05": win["macro_f05"], "macro_f05_w": win["macro_f05_w"],
+            "distractor_w": round(w, 4)}
 
 
 def predict(pct: int = 100):

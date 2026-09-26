@@ -40,8 +40,11 @@ N_THREADS = int(os.environ.get("ER_THREADS", os.cpu_count() or 4))
 N_FOLDS = int(os.environ.get("ER_FOLDS", 4))
 PARAMS = dict(objective="binary", learning_rate=0.05, num_leaves=127, min_data_in_leaf=200,
               feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1, lambda_l2=1.0,
-              seed=SEED, verbose=-1, num_threads=N_THREADS)
-N_ROUNDS = int(os.environ.get("ER_ROUNDS", 600))
+              seed=SEED, verbose=-1, num_threads=N_THREADS,
+              # identical models on every re-run (same data + same ER_THREADS)
+              deterministic=True, force_row_wise=True)
+N_ROUNDS = int(os.environ.get("ER_ROUNDS", 2000))  # early stopping decides; 600 was always hit
+FIT_SEED = SEED + 7  # row sample used for fitting (independent of the blocking/stage-1 buckets)
 MAX_PER_S1 = int(os.environ.get("ER_MAX_PER_S1", 11))
 UNSEEN_COUNTRIES = ("France",)  # in test only
 FR_DELTA = float(os.environ.get("ER_FR_DELTA", 0.1))  # added to the threshold for those countries
@@ -136,11 +139,23 @@ def ctx_join(split: str, pct: int, i: int):
     part.write_parquet(d / f"part_{i:03d}.parquet")
 
 
-def load_features(split: str, pct: int, columns=None) -> pl.DataFrame:
-    """All feature parts in one frame (train: a few M pairs). Rebuilt if the candidates are newer."""
+def load_features(split: str, pct: int, columns=None, row_filter: pl.Expr | None = None):
+    """Feature parts in one frame, optionally only rows matching row_filter (streamed per part).
+    Rebuilt first if the candidates are newer than the cached features."""
     if not _features_fresh(split, pct):
         build(split, pct)
-    return pl.concat([pl.read_parquet(f, columns=columns) for f in _parts(split, pct)])
+    out = []
+    for f in _parts(split, pct):
+        lf = pl.scan_parquet(f)
+        if row_filter is not None:
+            lf = lf.filter(row_filter)
+        out.append((lf.select(columns) if columns else lf).collect(engine="streaming"))
+    return pl.concat(out)
+
+
+def fit_rows(fit_pct: int) -> pl.Expr:
+    """S2/S3 records whose pairs are used to fit the stage-2 model (the rest are held out)."""
+    return pl.col("other_id").hash(FIT_SEED) % 100 < fit_pct
 
 
 FEATURES_PATH = WORK_DIR / "stage2_features.json"
@@ -193,12 +208,26 @@ def apply_rule(pairs: pl.DataFrame, dec: dict) -> pl.DataFrame:
     return decide(pairs, dec["threshold"])
 
 
+def _hashed(pairs: pl.DataFrame) -> pl.DataFrame:
+    """Same pairs with 64-bit hashed ids: sorts/joins/windows over ~13M pairs cost far less."""
+    return pairs.select(s1_id=pl.col("s1_id").hash(), other_id=pl.col("other_id").hash(), p="p")
+
+
+def apply_rule_ids(pairs: pl.DataFrame, dec: dict) -> pl.DataFrame:
+    """apply_rule on hashed ids, mapped back to the original string ids of the kept pairs."""
+    kept = apply_rule(_hashed(pairs), dec)
+    ids = pairs.select(_s=pl.col("s1_id").hash(), _o=pl.col("other_id").hash(),
+                       s1_str="s1_id", other_str="other_id")
+    return kept.join(ids, left_on=["s1", "other"], right_on=["_s", "_o"]).select(
+        s1="s1_str", other="other_str")
+
+
 def finalize(pairs: pl.DataFrame, dec: dict, fr_delta: float = FR_DELTA,
              max_per_s1: int = MAX_PER_S1) -> pl.DataFrame:
     """apply_rule, then the prediction-time guards: for S1 entities in UNSEEN_COUNTRIES keep only
     records with p >= threshold + fr_delta (threshold 0.5 under the entity rule), and keep at
     most max_per_s1 records (highest p) per S1 entity."""
-    m = apply_rule(pairs, dec).join(
+    m = apply_rule_ids(pairs, dec).join(
         pairs.select(pl.col("s1_id").alias("s1"), pl.col("other_id").alias("other"), "p"),
         on=["s1", "other"])
     unseen = (load_norm("test", 1, 100, columns=["entity_id", "country"])
@@ -213,11 +242,14 @@ def finalize(pairs: pl.DataFrame, dec: dict, fr_delta: float = FR_DELTA,
     return m.select("s1", "other")
 
 
-def train(pct: int, density_matched: bool = True):
+def train(pct: int, density_matched: bool = True, fit_pct: int = 100):
     """density_matched=False when train uses a smaller %% of Source 2/3 than test (--train-pct):
     per-S1 aggregates then differ between train and test, so the S1-context features and the
-    per-entity decision rule are left out."""
-    df = load_features("train", pct)
+    per-entity decision rule are left out.
+    fit_pct < 100: fit only on that share of the S2/S3 records (memory); the rest is scored as a
+    genuine hold-out by `calibrate`, giving a full-density validation."""
+    df = load_features("train", pct, row_filter=fit_rows(fit_pct) if fit_pct < 100 else None)
+    print(f"fitting on {df.height:,} pairs (fit_pct={fit_pct})", flush=True)
     cols = feature_cols(df, density_matched)
     with open(FEATURES_PATH, "w") as fh:
         json.dump(cols, fh)
@@ -233,7 +265,7 @@ def train(pct: int, density_matched: bool = True):
         tr, es = ~va & ~stop, ~va & stop
         m = lgb.train(PARAMS, lgb.Dataset(X[tr], y[tr], feature_name=cols), N_ROUNDS,
                       valid_sets=[lgb.Dataset(X[es], y[es])],
-                      callbacks=[lgb.early_stopping(50, verbose=False)])
+                      callbacks=[lgb.early_stopping(100, verbose=False)])
         oof[va] = m.predict(X[va], num_threads=N_THREADS)
         m.save_model(str(WORK_DIR / f"stage2_fold{f}.txt"))
         print(f"fold {f}: best_iter={m.best_iteration} ({time.time() - t:.0f}s)")
@@ -242,6 +274,28 @@ def train(pct: int, density_matched: bool = True):
 
     pairs = df.select("s1_id", "other_id").with_columns(p=pl.Series(oof))
     pairs.write_parquet(WORK_DIR / f"train_oof{'' if pct >= 100 else f'_p{pct}'}.parquet")
+
+
+def calibrate(pct: int, density_matched: bool = True, fit_pct: int = 100):
+    """Choose the decision rule on held-out probabilities: out-of-fold for the fitted rows, and
+    the fold-model average for rows never used in fitting (fit_pct < 100). With pct=100 this is
+    a full-density validation over every training S1 entity - the closest match to the test."""
+    pairs = pl.read_parquet(WORK_DIR / f"train_oof{'' if pct >= 100 else f'_p{pct}'}.parquet")
+    if fit_pct < 100:
+        with open(FEATURES_PATH) as fh:
+            cols = json.load(fh)
+        models = [lgb.Booster(model_file=str(WORK_DIR / f"stage2_fold{f}.txt"))
+                  for f in range(N_FOLDS)]
+        held = [pairs.with_columns(pl.col("p").cast(pl.Float32))]
+        for f in _parts("train", pct):
+            df = (pl.scan_parquet(f).filter(~fit_rows(fit_pct))
+                  .select("s1_id", "other_id", *cols).collect(engine="streaming"))
+            X = df.select(cols).cast(pl.Float32).to_numpy()
+            p = np.mean([m.predict(X, num_threads=N_THREADS) for m in models], axis=0)
+            held.append(df.select("s1_id", "other_id").with_columns(p=pl.Series(p, dtype=pl.Float32)))
+            del df, X
+        pairs = pl.concat(held)
+        print(f"calibrating on {pairs.height:,} held-out pairs", flush=True)
     best = evaluate(pairs, pct, rules=("threshold", "entity") if density_matched else ("threshold",))
     with open(WORK_DIR / "decision.json", "w") as fh:
         json.dump(best, fh)
@@ -251,6 +305,7 @@ def evaluate(pairs: pl.DataFrame, pct: int, rules=("threshold", "entity")) -> di
     """Grid-search both decision rules on OOF probabilities; returns the best as a decision dict."""
     gt = pl.read_parquet(WORK_DIR / "train_gt_pairs.parquet")
     s1_all = load_norm("train", 1, 100, columns=["entity_id"])["entity_id"]
+    pairs = pairs.with_columns(pl.col("p").cast(pl.Float32))
     if pct < 100:
         # sampled S2/S3: score only entities that have a sampled true match or any candidate,
         # otherwise the ~all-empty remainder inflates the macro average.
@@ -258,8 +313,12 @@ def evaluate(pairs: pl.DataFrame, pct: int, rules=("threshold", "entity")) -> di
                          for s in (2, 3)])
         gt = gt.join(oth, left_on="other", right_on="entity_id", how="semi")
         s1_all = pl.concat([gt["s1"], pairs["s1_id"]]).unique()
-    grids = {"threshold": np.round(np.arange(0.02, 0.99, 0.01), 2),
-             "entity": np.round(np.arange(-3.0, 3.01, 0.25), 2)}
+    # hashed ids from here on: ~13M pairs x ~50 settings stays light
+    s1_all = s1_all.hash()
+    gt = gt.select(s1=pl.col("s1").hash(), other=pl.col("other").hash())
+    pairs = _hashed(pairs)
+    grids = {"threshold": np.round(np.arange(0.20, 0.91, 0.02), 2),
+             "entity": np.round(np.arange(-2.0, 2.01, 0.25), 2)}
     grids = {r: g for r, g in grids.items() if r in rules}
     rows = []
     for rule, grid in grids.items():
@@ -339,6 +398,7 @@ if __name__ == "__main__":
     ap.add_argument("--split", default="train", choices=["train", "test"])
     ap.add_argument("--pct", type=int, default=100)
     ap.add_argument("--test-pct", type=int, default=None, help="train only: %% test will use")
+    ap.add_argument("--fit-pct", type=int, default=100)
     ap.add_argument("--fr-delta", type=float, default=FR_DELTA,
                     help="decide: extra probability required for France matches")
     ap.add_argument("--max-per-s1", type=int, default=MAX_PER_S1, help="decide: cap per S1 entity")
@@ -352,6 +412,6 @@ if __name__ == "__main__":
     elif a.cmd == "decide":
         redecide(a.fr_delta, a.max_per_s1)
     elif a.cmd == "train":
-        train(a.pct, density_matched=(a.test_pct or a.pct) == a.pct)
+        train(a.pct, density_matched=(a.test_pct or a.pct) == a.pct, fit_pct=a.fit_pct)
     else:
         predict(a.pct)

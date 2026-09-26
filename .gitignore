@@ -11,3 +11,4 @@ output_smoke/
 logs/
 archive/
 *.watchdog
+submissions/

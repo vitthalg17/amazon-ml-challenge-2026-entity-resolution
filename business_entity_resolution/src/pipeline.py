@@ -28,10 +28,10 @@ from config import DATA_DIR, OUTPUT_DIR
 
 STEPS = ["ingest", "translit", "prep_train", "prep_test", "stage1_data", "stage1",
          "block_train", "block_test", "eval_blocking", "match_features_train",
-         "match_features_test", "train", "predict", "validate"]
+         "match_features_test", "train", "calibrate", "predict", "validate"]
 
 
-def run_step(step: str, train_pct: int, test_pct: int, stage1_pct: int):
+def run_step(step: str, train_pct: int, test_pct: int, stage1_pct: int, fit_pct: int = 100):
     import blocking
     import eval_blocking
     import match
@@ -65,7 +65,9 @@ def run_step(step: str, train_pct: int, test_pct: int, stage1_pct: int):
     elif step == "match_features_test":
         match.build("test", test_pct)
     elif step == "train":
-        match.train(train_pct, density_matched=train_pct == test_pct)
+        match.train(train_pct, density_matched=train_pct == test_pct, fit_pct=fit_pct)
+    elif step == "calibrate":
+        match.calibrate(train_pct, density_matched=train_pct == test_pct, fit_pct=fit_pct)
     elif step == "predict":
         match.predict(test_pct)
     elif step == "validate":
@@ -90,13 +92,16 @@ def main():
     ap.add_argument("--stage1-pct", type=int, default=int(os.environ.get("ER_STAGE1_PCT", 6)),
                     help="%% of train Source 2/3 used to train the two cross-fitted stage-1 pruners")
     ap.add_argument("--steps", nargs="+", default=STEPS, choices=STEPS)
+    ap.add_argument("--fit-pct", type=int, default=100,
+                    help="%% of the blocked train S2/S3 records used to FIT the model (the rest is "
+                         "a full-density hold-out), e.g. --fit-pct 30 with train at 100%%")
     ap.add_argument("--one-step", action="store_true", help=argparse.SUPPRESS)
     a = ap.parse_args()
     train_pct = a.train_pct if a.train_pct is not None else a.pct
     test_pct = a.test_pct if a.test_pct is not None else a.pct
     steps = [s for s in STEPS if s in a.steps]
     if a.one_step:  # child process: run exactly one step in-process
-        run_step(steps[0], train_pct, test_pct, a.stage1_pct)
+        run_step(steps[0], train_pct, test_pct, a.stage1_pct, a.fit_pct)
         return
     print(f"train_pct={train_pct} test_pct={test_pct} stage1_pct={a.stage1_pct}", flush=True)
     for step in steps:
@@ -105,7 +110,7 @@ def main():
         # every step in a fresh process: memory from earlier steps is fully returned to the OS
         rc = subprocess.call([sys.executable, "-u", __file__, "--one-step", "--steps", step,
                               "--train-pct", str(train_pct), "--test-pct", str(test_pct),
-                              "--stage1-pct", str(a.stage1_pct)])
+                              "--stage1-pct", str(a.stage1_pct), "--fit-pct", str(a.fit_pct)])
         if rc:
             raise SystemExit(f"step {step} failed (exit code {rc})")
         print(f"===== {step} done in {time.time() - t:.0f}s", flush=True)

@@ -334,7 +334,10 @@ def train(pct: int, density_matched: bool = True, fit_pct: int = 100):
     flt = fit_rows(fit_pct) if fit_pct < 100 else pl.lit(True)
     counts = [pl.scan_parquet(f).filter(flt).select(pl.len()).collect().item() for f in parts]
     n = sum(counts)
-    X = np.empty((n, len(cols)), dtype=np.float32)
+    # disk-backed: once flushed these pages are clean file cache the OS can drop, so the
+    # 2 GB matrix does not add to the LightGBM construction peak (same values, same model)
+    X = np.lib.format.open_memmap(WORK_DIR / "train_X.npy", mode="w+", dtype=np.float32,
+                                  shape=(n, len(cols)))
     y = np.empty(n, dtype=np.int8)
     ids, off = [], 0
     for f, c in zip(parts, counts):
@@ -346,13 +349,22 @@ def train(pct: int, density_matched: bool = True, fit_pct: int = 100):
         off += c
         del df
     ids = pl.concat(ids)
+    X.flush()
     print(f"fitting on {n:,} pairs x {len(cols)} features (fit_pct={fit_pct})", flush=True)
     fold = (ids["s1_id"].hash(SEED) % N_FOLDS).to_numpy()
     # early stopping on S1 entities outside the OOF fold; a different 10% slice per fold, so no
     # row is excluded from fitting by every fold model
     es_group = (ids["s1_id"].hash(SEED + 1) % 10).to_numpy()
-    full = lgb.Dataset(X, y, feature_name=cols, free_raw_data=False,
-                       params={"max_bin": 255, "verbose": -1}).construct()
+    full = lgb.Dataset(X, y, feature_name=cols, free_raw_data=True,
+                       params={"max_bin": 255, "verbose": -1, "force_row_wise": True,
+                               "num_threads": N_THREADS,
+                               # dense bins (1 byte/value, 0.5 GB): the sparse ones are built
+                               # through per-thread push buffers that spike by several GB
+                               "enable_sparse": False}).construct()
+    # LightGBM only needs its binned copy now: close the matrix (~1.2 GB less per million rows
+    # in total) and read each fold's rows back from disk for the out-of-fold predictions
+    del X
+    X = np.load(WORK_DIR / "train_X.npy", mmap_mode="r")
     oof = np.zeros(n, dtype=np.float32)
     for f in range(N_FOLDS):
         t = time.time()
@@ -367,6 +379,11 @@ def train(pct: int, density_matched: bool = True, fit_pct: int = 100):
         print(f"fold {f}: best_iter={m.best_iteration} ({time.time() - t:.0f}s)", flush=True)
     imp = sorted(zip(m.feature_importance("gain"), cols), reverse=True)
     print("top features:", [(c, round(g / 1e3)) for g, c in imp[:25]])
+    del X, full
+    try:
+        (WORK_DIR / "train_X.npy").unlink()
+    except OSError:
+        pass
 
     pairs = ids.with_columns(p=pl.Series(oof))
     pairs.write_parquet(WORK_DIR / f"train_oof{'' if pct >= 100 else f'_p{pct}'}.parquet")

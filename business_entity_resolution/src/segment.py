@@ -18,10 +18,11 @@ import polars as pl
 from config import WORK_DIR, pq_path
 
 SPLITS_PATH = WORK_DIR / "name_splits.json"
-MIN_LEN = 7          # only tokens at least this long are split
-MAX_KNOWN = 2        # tokens seen this often among S1 names are left alone
-MIN_PIECE = 3        # shortest word a token is split into
-MIN_PIECE_COUNT = 5  # words must be this common among S1 names
+MIN_LEN = 8             # only tokens at least this long are split
+MAX_KNOWN = 2           # tokens seen this often among S1 names are left alone
+MIN_PIECE = 4           # words a token is split into: at least 4 letters and seen in
+MIN_PIECE_COUNT = 20    # 20+ S1 names (the names hold many invented syllables: "vaex")
+SHORT_PIECE_COUNT = 1000  # 3-letter words only when very common ("pvt", "ltd", "the")
 MAX_PIECES = 4
 
 
@@ -41,12 +42,12 @@ def split_token(t: str, count: dict, n_total: int) -> str | None:
     n = len(t)
     best = [None] * (n + 1)  # best[i]: (log-prob, pieces) of the prefix t[:i]
     best[0] = (0.0, [])
-    for i in range(MIN_PIECE, n + 1):
-        for j in range(max(0, i - 25), i - MIN_PIECE + 1):
+    for i in range(3, n + 1):
+        for j in range(max(0, i - 25), i - 2):
             if best[j] is None or len(best[j][1]) >= MAX_PIECES:
                 continue
             c = count.get(t[j:i], 0)
-            if c < MIN_PIECE_COUNT:
+            if c < (MIN_PIECE_COUNT if i - j >= MIN_PIECE else SHORT_PIECE_COUNT):
                 continue
             sc = best[j][0] + math.log(c / n_total)
             if best[i] is None or sc > best[i][0]:

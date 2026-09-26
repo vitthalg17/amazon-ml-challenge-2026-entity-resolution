@@ -25,8 +25,9 @@ HEADER = ("# Submissions\n\n"
           "|---|---|---|---|---|---|\n")
 
 
-def git(*args) -> str:
-    return subprocess.run(["git", *args], cwd=ROOT, capture_output=True, text=True).stdout.strip()
+def git(*args, repo=None) -> str:
+    return subprocess.run(["git", *args], cwd=repo or ROOT, capture_output=True,
+                          text=True).stdout.strip()
 
 
 def rows() -> list[list[str]]:
@@ -45,21 +46,24 @@ def write_index(table: list[list[str]]):
                      encoding="utf-8")
 
 
-def save(title: str, log: str | None):
+def save(title: str, log: str | None, output=None, work=None, repo=None):
+    output, work = Path(output or ROOT / "output"), Path(work or ROOT / "work")
     table = rows()
     n = max([int(re.match(r"v(\d+)", r[0]).group(1)) for r in table] + [0]) + 1
     slug = re.sub(r"[^a-z0-9]+", "_", title.lower()).strip("_")[:40]
     d = SUB / f"v{n}_{slug}"
     d.mkdir(parents=True)
     # only the leaderboard file at the top level; the blocking set is for the final zip only
-    shutil.copy2(ROOT / "output" / "matching_results.tsv", d / "matching_results.tsv")
+    shutil.copy2(output / "matching_results.tsv", d / "matching_results.tsv")
     (d / "for_final_zip").mkdir()
-    shutil.copy2(ROOT / "output" / "candidate_pairs.tsv", d / "for_final_zip" / "candidate_pairs.tsv")
-    dec = ROOT / "work" / "decision.json"
+    shutil.copy2(output / "candidate_pairs.tsv", d / "for_final_zip" / "candidate_pairs.tsv")
+    dec = work / "decision.json"
     if dec.exists():
         shutil.copy2(dec, d / "decision.json")
-    branch, commit = git("rev-parse", "--abbrev-ref", "HEAD"), git("rev-parse", "--short", "HEAD")
-    dirty = " (+ uncommitted changes)" if git("status", "--porcelain", "business_entity_resolution") else ""
+    branch = git("rev-parse", "--abbrev-ref", "HEAD", repo=repo)
+    commit = git("rev-parse", "--short", "HEAD", repo=repo)
+    dirty = (" (+ uncommitted changes)"
+             if git("status", "--porcelain", "business_entity_resolution", repo=repo) else "")
     val, cmd = "?", "?"
     if log and Path(log).exists():
         text = Path(log).read_text(encoding="utf-8", errors="replace")
@@ -71,6 +75,10 @@ def save(title: str, log: str | None):
         c = re.findall(r"^train_pct=.*$", text, re.M)
         cmd = c[-1] if c else "?"
     decision = json.loads(dec.read_text()) if dec.exists() else {}
+    if "macro_f05_w" in decision:  # calibrate records the chosen stage / rule and both scores
+        param = decision.get("threshold", decision.get("shift"))
+        val = (f"{decision['macro_f05_w']:.4f} test-mix / {decision['macro_f05']:.4f} train-mix "
+               f"(stage {decision.get('stage', 2)}, {decision['rule']} {param})")
     (d / "NOTES.md").write_text(
         f"# v{n}: {title}\n\n"
         f"- Saved: {datetime.now():%Y-%m-%d %H:%M}\n"
@@ -105,8 +113,11 @@ if __name__ == "__main__":
     ap.add_argument("title", nargs="?")
     ap.add_argument("--log")
     ap.add_argument("--lb", nargs=2, metavar=("VERSION", "SCORE"))
+    ap.add_argument("--output", help="output folder (default <repo>/output)")
+    ap.add_argument("--work", help="work folder with decision.json (default <repo>/work)")
+    ap.add_argument("--repo", help="git checkout the run's code came from (default this repo)")
     a = ap.parse_args()
     if a.lb:
         set_lb(*a.lb)
     else:
-        save(a.title or "run", a.log)
+        save(a.title or "run", a.log, a.output, a.work, a.repo)

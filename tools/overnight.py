@@ -65,7 +65,9 @@ def main():
                     help="free RAM required before a step (re)starts")
     ap.add_argument("--retries", type=int, default=6)
     ap.add_argument("--title", default=None, help="save the output as a submission when done")
+    ap.add_argument("--src", default=str(SRC), help="code folder to run (e.g. a git worktree)")
     a = ap.parse_args()
+    src = Path(a.src)
 
     log = LOGS / f"{a.name}.driver.log"
     state_file = LOGS / f"{a.name}.state.json"
@@ -84,7 +86,7 @@ def main():
             t = time.time()
             rc = subprocess.call(
                 [sys.executable, str(ROOT / "tools" / "run_guarded.py"),
-                 "--min-avail-mb", str(a.min_avail_mb), "--log", str(step_log), "--cwd", str(SRC),
+                 "--min-avail-mb", str(a.min_avail_mb), "--log", str(step_log), "--cwd", str(src),
                  "--", sys.executable, "-u", "pipeline.py", "--steps", step,
                  "--train-pct", str(a.train_pct), "--test-pct", str(a.test_pct),
                  "--fit-pct", str(a.fit_pct)], env=env)
@@ -110,8 +112,12 @@ def main():
             for f in sorted(LOGS.glob(f"{a.name}_*.log"), key=lambda p: p.stat().st_mtime):
                 out.write(f"\n##### {f.name}\n")
                 out.write(f.read_text(encoding="utf-8", errors="replace"))
-        rc = subprocess.call([sys.executable, str(ROOT / "tools" / "save_submission.py"),
-                              a.title, "--log", str(combined)], cwd=ROOT)
+        save = [sys.executable, str(ROOT / "tools" / "save_submission.py"), a.title,
+                "--log", str(combined), "--repo", str(src.parents[1])]
+        for var, flag in (("ER_OUTPUT_DIR", "--output"), ("ER_WORK_DIR", "--work")):
+            if env.get(var):
+                save += [flag, env[var]]
+        rc = subprocess.call(save, cwd=ROOT)
         say(log, f"save_submission exit {rc}")
 
 

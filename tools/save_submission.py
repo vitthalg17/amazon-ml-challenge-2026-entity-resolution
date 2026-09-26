@@ -51,8 +51,10 @@ def save(title: str, log: str | None):
     slug = re.sub(r"[^a-z0-9]+", "_", title.lower()).strip("_")[:40]
     d = SUB / f"v{n}_{slug}"
     d.mkdir(parents=True)
-    for f in ("matching_results.tsv", "candidate_pairs.tsv"):
-        shutil.copy2(ROOT / "output" / f, d / f)
+    # only the leaderboard file at the top level; the blocking set is for the final zip only
+    shutil.copy2(ROOT / "output" / "matching_results.tsv", d / "matching_results.tsv")
+    (d / "for_final_zip").mkdir()
+    shutil.copy2(ROOT / "output" / "candidate_pairs.tsv", d / "for_final_zip" / "candidate_pairs.tsv")
     dec = ROOT / "work" / "decision.json"
     if dec.exists():
         shutil.copy2(dec, d / "decision.json")

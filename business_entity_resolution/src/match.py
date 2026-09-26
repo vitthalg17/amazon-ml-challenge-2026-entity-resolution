@@ -68,7 +68,7 @@ def _fingerprint(split: str, pct: int) -> str:
     candidate file. A change to either invalidates the cache."""
     import hashlib
     h = hashlib.sha1()
-    for mod in ("features.py", "normalize.py", "match.py"):
+    for mod in ("features.py", "normalize.py"):  # the code that decides feature values
         h.update((Path(__file__).parent / mod).read_bytes())
     c = candidates_path(split, pct)
     h.update(f"{c.stat().st_size}:{c.stat().st_mtime_ns}".encode())
@@ -81,31 +81,71 @@ def _features_fresh(split: str, pct: int) -> bool:
 
 
 def build(split: str, pct: int) -> None:
-    """Features in parts of ~PAIRS_PER_PART pairs, so peak memory stays a few GB even for the
-    ~13M test pairs: pair features chunk by chunk (only that chunk's S2/S3 rows are loaded), then
-    context features over all pairs from a slim numeric table, then joined back part by part.
+    """Features in parts of ~PAIRS_PER_PART pairs, so peak memory stays a few GB for any size:
+      1. pair features, one short-lived process per part (only that part's rows are loaded)
+      2. context features from the slim hashed context-base tables, computed per hash
+         partition of the S2/S3 record (o-context) and of the S1 entity (s-context)
+      3. context joined back into each part (again one process per part)
+    Resumable: a re-run with the same inputs keeps finished parts / phases.
     Output: <work>/<split>_features[_pN]/part_*.parquet (+ _DONE marker)."""
     t = time.time()
+    if _features_fresh(split, pct):
+        print(f"{split}: features up to date (same code and candidates) - kept", flush=True)
+        return
     d = feature_dir(split, pct)
     d.mkdir(parents=True, exist_ok=True)
-    for f in d.glob("*"):
-        f.unlink()
+    fp = _fingerprint(split, pct)
     cp = candidates_path(split, pct)
-    n_parts = max(1, -(-pl.scan_parquet(cp).select(pl.len()).collect().item() // PAIRS_PER_PART))
+    n_pairs = pl.scan_parquet(cp).select(pl.len()).collect().item()
+    n_parts = max(1, -(-n_pairs // PAIRS_PER_PART))
+    sig = d / "_SIG"
+    if not (sig.exists() and sig.read_text() == f"{fp}|{n_parts}"):
+        for f in d.glob("*"):
+            f.unlink()
+        sig.write_text(f"{fp}|{n_parts}")
+    (d / "_DONE").unlink(missing_ok=True)
     # Every part runs in its own short-lived process: the libraries do not hand freed memory
     # back to the OS within one process, so a long loop grows by ~1 GB per part.
     for i in range(n_parts):
-        _child("feature-part", split, pct, i, n_parts)
-    ctx = features.context_features(pl.scan_parquet(sorted(d.glob("ctxbase_*.parquet"))))
-    ctx.write_parquet(d / "ctx.parquet")
-    del ctx
+        if not (d / f"ctxbase_{i:03d}.parquet").exists():
+            _child("feature-part", split, pct, i, n_parts)
+    if not (d / "_CTX_DONE").exists():
+        _context_partitions(d, max(4, -(-n_pairs // 2_000_000)))
+        (d / "_CTX_DONE").touch()
     for i in range(n_parts):
         _child("ctx-join", split, pct, i, n_parts)
-    for f in [*d.glob("ctxbase_*.parquet"), d / "ctx.parquet"]:
-        f.unlink()
-    (d / "_DONE").write_text(_fingerprint(split, pct))
+    for pat in ("ctxbase_*.parquet", "ctx_o_*.parquet", "ctx_s_*.parquet"):
+        for f in d.glob(pat):
+            f.unlink()
+    (d / "_CTX_DONE").unlink(missing_ok=True)
+    (d / "_DONE").write_text(fp)
     n_cols = len(pl.read_parquet_schema(d / "part_000.parquet"))
     print(f"{split}: {n_parts} parts, {n_cols} columns in {time.time() - t:.0f}s")
+
+
+def _context_partitions(d, n_part: int):
+    """Same values as features.context_features, computed per hash partition so that only
+    ~2M pairs are in memory at a time: o-context (per S2/S3 record) partitioned by _o, s-context
+    (per S1 entity) partitioned by _s."""
+    base = pl.scan_parquet(sorted(d.glob("ctxbase_*.parquet")))
+    cb = features.CTX_BASE
+    o_feats = [(pl.col(c).max().over("_o") - pl.col(c)).alias(f"{c}_gap_o") for c in cb] + [
+        pl.col("cos_sum").rank("ordinal", descending=True).over("_o").cast(pl.Int16).alias("rank_o"),
+        pl.len().over("_o").cast(pl.Int16).alias("ncand_o"),
+        (pl.col("cos_sum") - pl.col("cos_sum").sort(descending=True).slice(1, 1).first()
+         .over("_o")).fill_null(1.0).alias("cos_sum_margin2_o"),
+    ]
+    s_feats = [(pl.col(c).max().over("_s") - pl.col(c)).alias(f"{c}_gap_s") for c in cb] + [
+        pl.col("cos_sum").rank("ordinal", descending=True).over("_s").cast(pl.Int16).alias("rank_s"),
+        pl.len().over("_s").cast(pl.Int16).alias("ncand_s"),
+    ]
+    for j in range(n_part):
+        for key, feats, tag in (("_o", o_feats, "o"), ("_s", s_feats, "s")):
+            part = base.filter(pl.col(key) % n_part == j).collect(engine="streaming")
+            # sorted by part id + small row groups: ctx_join reads only its own part's rows
+            (part.select(*features.KEYS, "_p", *feats).sort("_p")
+             .write_parquet(d / f"ctx_{tag}_{j:03d}.parquet", row_group_size=100_000))
+            del part
 
 
 def _child(cmd: str, split: str, pct: int, i: int, n_parts: int):
@@ -145,11 +185,19 @@ def feature_part(split: str, pct: int, i: int, n_parts: int):
 
 def ctx_join(split: str, pct: int, i: int):
     d = feature_dir(split, pct)
-    ctx = (pl.scan_parquet(d / "ctx.parquet").filter(pl.col("_p") == i).drop("_p")
-           .collect(engine="streaming"))
-    part = pl.read_parquet(d / f"part_{i:03d}.parquet")
-    part = features.with_keys(part).join(ctx, on=features.KEYS, how="left").drop(features.KEYS)
-    part.write_parquet(d / f"part_{i:03d}.parquet")
+    f = d / f"part_{i:03d}.parquet"
+    if "rank_o" in pl.read_parquet_schema(f):
+        return  # joined in an earlier (interrupted) run
+    ctx = [pl.scan_parquet(d / f"ctx_{tag}_*.parquet").filter(pl.col("_p") == i).drop("_p")
+           .collect(engine="streaming") for tag in ("o", "s")]
+    part = pl.read_parquet(f)
+    cols = part.columns
+    part = features.with_keys(part)
+    for c in ctx:
+        part = part.join(c, on=features.KEYS, how="left")
+    tmp = f.with_suffix(".tmp")
+    part.select(*cols, *features.CTX_COLS).write_parquet(tmp)  # same column order as before
+    os.replace(tmp, f)  # atomic: an interruption never leaves a half-written part
 
 
 def load_features(split: str, pct: int, columns=None, row_filter: pl.Expr | None = None):
@@ -273,34 +321,54 @@ def train(pct: int, density_matched: bool = True, fit_pct: int = 100):
     per-S1 aggregates then differ between train and test, so the S1-context features and the
     per-entity decision rule are left out.
     fit_pct < 100: fit only on that share of the S2/S3 records (memory); the rest is scored as a
-    genuine hold-out by `calibrate`, giving a full-density validation."""
-    df = load_features("train", pct, row_filter=fit_rows(fit_pct) if fit_pct < 100 else None)
-    print(f"fitting on {df.height:,} pairs (fit_pct={fit_pct})", flush=True)
-    cols = feature_cols(df, density_matched)
+    genuine hold-out by `score`, giving a full-density validation.
+    The feature matrix is filled part by part into one preallocated float32 array."""
+    if not _features_fresh("train", pct):
+        build("train", pct)
+    parts = _parts("train", pct)
+    schema = pl.read_parquet_schema(parts[0])
+    cols = [c for c in schema if c not in ("other_id", "s1_id", "country", "label")
+            and (density_matched or not is_s1_context(c))]
     with open(FEATURES_PATH, "w") as fh:
         json.dump(cols, fh)
-    X = df.select(cols).cast(pl.Float32).to_numpy()
-    y = df["label"].to_numpy()
-    fold = (df["s1_id"].hash(SEED) % N_FOLDS).to_numpy()
+    flt = fit_rows(fit_pct) if fit_pct < 100 else pl.lit(True)
+    counts = [pl.scan_parquet(f).filter(flt).select(pl.len()).collect().item() for f in parts]
+    n = sum(counts)
+    X = np.empty((n, len(cols)), dtype=np.float32)
+    y = np.empty(n, dtype=np.int8)
+    ids, off = [], 0
+    for f, c in zip(parts, counts):
+        df = (pl.scan_parquet(f).filter(flt).select("s1_id", "other_id", "label", *cols)
+              .collect(engine="streaming"))
+        X[off:off + c] = df.select(cols).cast(pl.Float32).to_numpy()
+        y[off:off + c] = df["label"].to_numpy()
+        ids.append(df.select("s1_id", "other_id"))
+        off += c
+        del df
+    ids = pl.concat(ids)
+    print(f"fitting on {n:,} pairs x {len(cols)} features (fit_pct={fit_pct})", flush=True)
+    fold = (ids["s1_id"].hash(SEED) % N_FOLDS).to_numpy()
     # early stopping on S1 entities outside the OOF fold; a different 10% slice per fold, so no
     # row is excluded from fitting by every fold model
-    es_group = (df["s1_id"].hash(SEED + 1) % 10).to_numpy()
-    oof = np.zeros(len(y), dtype=np.float32)
+    es_group = (ids["s1_id"].hash(SEED + 1) % 10).to_numpy()
+    full = lgb.Dataset(X, y, feature_name=cols, free_raw_data=False,
+                       params={"max_bin": 255, "verbose": -1}).construct()
+    oof = np.zeros(n, dtype=np.float32)
     for f in range(N_FOLDS):
         t = time.time()
         va = fold == f
         es = ~va & (es_group == f)
         tr = ~va & ~es
-        m = lgb.train(PARAMS, lgb.Dataset(X[tr], y[tr], feature_name=cols), N_ROUNDS,
-                      valid_sets=[lgb.Dataset(X[es], y[es])],
+        m = lgb.train(PARAMS, full.subset(np.flatnonzero(tr)), N_ROUNDS,
+                      valid_sets=[full.subset(np.flatnonzero(es))],
                       callbacks=[lgb.early_stopping(100, verbose=False)])
         oof[va] = m.predict(X[va], num_threads=N_THREADS)
         m.save_model(str(WORK_DIR / f"stage2_fold{f}.txt"))
-        print(f"fold {f}: best_iter={m.best_iteration} ({time.time() - t:.0f}s)")
+        print(f"fold {f}: best_iter={m.best_iteration} ({time.time() - t:.0f}s)", flush=True)
     imp = sorted(zip(m.feature_importance("gain"), cols), reverse=True)
     print("top features:", [(c, round(g / 1e3)) for g, c in imp[:25]])
 
-    pairs = df.select("s1_id", "other_id").with_columns(p=pl.Series(oof))
+    pairs = ids.with_columns(p=pl.Series(oof))
     pairs.write_parquet(WORK_DIR / f"train_oof{'' if pct >= 100 else f'_p{pct}'}.parquet")
 
 
@@ -356,13 +424,28 @@ def score(pct: int, test_pct: int, fit_pct: int = 100):
 
 
 def calibrate(pct: int, density_matched: bool = True, fit_pct: int = 100):
-    """Choose the decision rule on held-out train probabilities (see `score`). With pct=100 this
-    is a full-density validation over every training S1 entity - the setting of the test."""
-    pairs = final_scores("train")
-    print(f"calibrating on {pairs.height:,} held-out pairs", flush=True)
-    best = evaluate(pairs, pct, rules=("threshold", "entity") if density_matched else ("threshold",))
+    """Choose the stage (2, or 3 if it ran for the current stage-2 scores) and the decision rule
+    on held-out train probabilities (see `score`); both stages' scores are honest (out-of-fold
+    or never fitted). With pct=100 this is a full-density validation over every training S1
+    entity - the setting of the test."""
+    rules = ("threshold", "entity") if density_matched else ("threshold",)
+    stages = [2]
+    p2, p3 = scores_path("train", 2), scores_path("train", 3)
+    if p3.exists() and p3.stat().st_mtime >= p2.stat().st_mtime \
+            and scores_path("test", 3).exists():
+        stages.append(3)
+    results = {}
+    for stage in stages:
+        pairs = pl.read_parquet(scores_path("train", stage))
+        print(f"== stage {stage}: calibrating on {pairs.height:,} held-out pairs", flush=True)
+        results[stage] = evaluate(pairs, pct, rules=rules)
+        del pairs
+    best = max(results, key=lambda st: results[st]["macro_f05"])
+    dec = {**results[best], "stage": best}
+    print("stage scores:", {st: round(r["macro_f05"], 5) for st, r in results.items()},
+          "-> using", dec, flush=True)
     with open(WORK_DIR / "decision.json", "w") as fh:
-        json.dump(best, fh)
+        json.dump(dec, fh)
 
 
 def evaluate(pairs: pl.DataFrame, pct: int, rules=("threshold", "entity")) -> dict:
@@ -381,8 +464,8 @@ def evaluate(pairs: pl.DataFrame, pct: int, rules=("threshold", "entity")) -> di
     s1_all = s1_all.hash()
     gt = gt.select(s1=pl.col("s1").hash(), other=pl.col("other").hash())
     pairs = _hashed(pairs)
-    grids = {"threshold": np.round(np.arange(0.20, 0.91, 0.02), 2),
-             "entity": np.round(np.arange(-2.0, 2.01, 0.25), 2)}
+    grids = {"threshold": np.round(np.arange(0.30, 0.81, 0.02), 2),
+             "entity": np.round(np.arange(-1.5, 1.51, 0.25), 2)}
     grids = {r: g for r, g in grids.items() if r in rules}
     rows = []
     for rule, grid in grids.items():
@@ -403,14 +486,16 @@ def evaluate(pairs: pl.DataFrame, pct: int, rules=("threshold", "entity")) -> di
     print("  ".join(f"{r}: {b['macro_f05']:.4f}" for r, b in best.items())
           + f"  -> using {win['rule']} (param {win['param']}; entities: {win['n_entities']:,}, "
             f"singletons: {win['n_singletons']:,})")
-    return {"rule": win["rule"], "shift" if win["rule"] == "entity" else "threshold": win["param"]}
+    return {"rule": win["rule"], "shift" if win["rule"] == "entity" else "threshold": win["param"],
+            "macro_f05": win["macro_f05"]}
 
 
 def predict(pct: int = 100):
-    """Apply the calibrated decision rule + guards to the final test scores and write outputs."""
-    pairs = final_scores("test")
+    """Apply the calibrated stage + decision rule + guards to the test scores, write outputs."""
     with open(WORK_DIR / "decision.json") as fh:
         dec = json.load(fh)
+    pairs = pl.read_parquet(scores_path("test", dec.get("stage", 2)))
+    print(f"test: using stage-{dec.get('stage', 2)} scores", flush=True)
     pairs.write_parquet(WORK_DIR / "test_scores.parquet")  # what `decide` re-uses
     print("decision:", dec)
     write_outputs(finalize(pairs, dec), pairs.select("s1_id", "other_id"))

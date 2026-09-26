@@ -9,19 +9,26 @@ from prep import load_norm
 
 
 def evaluate(pct: int = 100, raw: bool = False, ks=(1, 2, 3, 5, 10)):
-    cand = pl.read_parquet(candidates_path("train", pct, raw))
+    chans = list(CHANNELS) + ["exact", "exact_addr"]
+    lf = pl.scan_parquet(candidates_path("train", pct, raw))
+    n_cand = lf.select(pl.len()).collect().item()
     oth = pl.concat([load_norm("train", s, pct,
                                      columns=["entity_id", "country", "addr_norm"])
                      for s in (2, 3)])
     gt = (pl.read_parquet(WORK_DIR / "train_gt_pairs.parquet")
           .join(oth, left_on="other", right_on="entity_id"))
     n_gt, n_oth = gt.height, oth.height
+    del oth
     print(f"records blocked: {n_oth:,}  true pairs among them: {n_gt:,} "
           f"(distractors: {n_oth - n_gt:,})")
-    print(f"candidate pairs: {cand.height:,} ({cand.height / n_oth:.1f} per S2/S3 record)")
+    print(f"candidate pairs: {n_cand:,} ({n_cand / n_oth:.1f} per S2/S3 record)")
+    # only the candidate rows that are true pairs matter for recall (streamed, few columns)
+    cand = (lf.select("s1_id", "other_id", "cos_combo", *[f"rank_{ch}" for ch in chans])
+            .join(gt.lazy().select(s1_id="s1", other_id="other"), on=["s1_id", "other_id"],
+                  how="semi")
+            .collect(engine="streaming"))
 
     hit = gt.join(cand, left_on=["s1", "other"], right_on=["s1_id", "other_id"], how="left")
-    chans = list(CHANNELS) + ["exact", "exact_addr"]
     rows = []
     for k in ks:
         flags = {ch: (pl.col(f"rank_{ch}") < k).fill_null(False) for ch in chans}

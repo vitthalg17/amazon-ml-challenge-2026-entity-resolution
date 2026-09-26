@@ -12,7 +12,9 @@ every candidate pair and reused as model features.
 """
 import argparse
 import os
+import shutil
 import time
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -98,11 +100,11 @@ def topk_pairs(Q: sp.csr_matrix, BT: sp.csr_matrix, k: int, thresh: float, col: 
                          col: rank.astype(np.int8)})
 
 
-def exact_pairs(s1: pl.DataFrame, oth: pl.DataFrame) -> pl.DataFrame:
-    a = s1.select(key=name_key_expr()).with_row_index("si")
-    a = a.filter(pl.len().over("key") <= EXACT_MAX_GROUP)
-    b = oth.select(key=name_key_expr()).with_row_index("oi")
-    return (b.join(a, on="key").select(pl.col("oi").cast(pl.Int32), pl.col("si").cast(pl.Int32))
+def exact_pairs(s1_small: pl.DataFrame, keys: pl.DataFrame) -> pl.DataFrame:
+    """keys: (oi, key) of the queries; s1_small: (key, si) of S1 names shared by <= EXACT_MAX_GROUP
+    entities. Every S1 with the identical order-free core name is a candidate."""
+    return (keys.join(s1_small, on="key").select(pl.col("oi").cast(pl.Int32),
+                                                 pl.col("si").cast(pl.Int32))
             .with_columns(rank_exact=pl.lit(0, dtype=pl.Int8)))
 
 
@@ -132,22 +134,21 @@ def exact_addr_pairs(keys: pl.DataFrame, big: pl.DataFrame, Q: sp.csr_matrix, A:
                                  rank_exact_addr=pl.col("r").cast(pl.Int8))
 
 
-def block_country(s1: pl.DataFrame, oth: pl.DataFrame, k: dict[str, int] | None = None,
+def block_country(s1: pl.DataFrame, qpath, n: int, k: dict[str, int] | None = None,
                   pruner=None, thresh: float = 0.05, cross_fit: bool = False,
-                  prune_pmin: float | None = None) -> pl.DataFrame:
-    """Candidates for one country. Processes S2/S3 records in chunks of CHUNK so memory stays
-    bounded (queries are vectorized per chunk); when `pruner` (stage-1 model) is given, each chunk
-    is pruned before it is kept.
+                  prune_pmin: float | None = None, spill_dir=None) -> None:
+    """Candidates for one country. The S2/S3 queries are streamed from `qpath` (a parquet file
+    with the country's n query records) CHUNK rows at a time, so only the S1 index and one chunk
+    are ever in memory. When `pruner` (stage-1 model) is given, each chunk is pruned before it
+    is kept. Each chunk's result is written to spill_dir.
     cross_fit (train only): records the main pruner was trained on are pruned by the alt one."""
     t0 = time.time()
-    in_main = None
-    if pruner is not None and cross_fit and pruner["half"]:
-        in_main = (oth["entity_id"].hash(SEED) % 100 < pruner["half"]).to_numpy()
     t1 = channel_texts(s1)
     fitted = {}
     for ch, spec in CHANNEL_SPECS.items():
         vec = spec["vec"]()
         A = vec.fit_transform(t1[ch]).tocsr()
+        vec.stop_words_ = None  # every term cut by min_df (millions of bigrams); never used again
         BT = A.T.tocsr()
         # Retrieval cost is the sum of posting-list lengths of each query's features, so very
         # common features (" sh", "rd", "mh") are dropped from the *query* side for retrieval
@@ -157,20 +158,23 @@ def block_country(s1: pl.DataFrame, oth: pl.DataFrame, k: dict[str, int] | None 
         fitted[ch] = (vec, A, BT, keep)
         t1[ch] = None
     del t1
+    s1_keys = s1.select(key=name_key_expr()).with_row_index("si").with_columns(
+        pl.col("si").cast(pl.Int32)).with_columns(n=pl.len().over("key"))
+    small = s1_keys.filter(pl.col("n") <= EXACT_MAX_GROUP).select("key", "si")
+    big = s1_keys.filter(pl.col("n").is_between(EXACT_MAX_GROUP + 1, EXACT_BIG_MAX)).select("key", "si")
+    big_keys = big.select("key").unique()
+    s1_ids = s1["entity_id"]
+    del s1_keys
     print(f"    vectorized in {time.time() - t0:.0f}s", flush=True)
 
-    exact = exact_pairs(s1, oth)
-    s1_keys = s1.select(key=name_key_expr()).with_row_index("si").with_columns(
-        pl.col("si").cast(pl.Int32))
-    big = s1_keys.filter(pl.len().over("key").is_between(EXACT_MAX_GROUP + 1, EXACT_BIG_MAX))
-    oth_keys = oth.select(key=name_key_expr()).with_row_index("oi").with_columns(
-        pl.col("oi").cast(pl.Int32)).join(big.select("key").unique(), on="key", how="semi")
-    out, n_raw = [], 0
+    n_raw, n_kept = 0, 0
     with ThreadPoolExecutor(len(fitted)) as pool:  # per-channel cosines run in parallel
-        for s in range(0, oth.height, CHUNK):
-            e = min(s + CHUNK, oth.height)
-            parts = [exact.filter(pl.col("oi").is_between(s, e - 1))]
-            to = channel_texts(oth.slice(s, e - s))  # query texts per chunk: bounded memory
+        for s in range(0, n, CHUNK):
+            q = pl.scan_parquet(qpath).slice(s, CHUNK).collect()
+            keys = q.select(key=name_key_expr()).with_row_index("oi", offset=s).with_columns(
+                pl.col("oi").cast(pl.Int32))
+            parts = [exact_pairs(small, keys)]
+            to = channel_texts(q)
             qs = {}
             for ch, (vec, A, BT, keep) in fitted.items():
                 Q = qs[ch] = vec.transform(to[ch]).tocsr()
@@ -178,7 +182,7 @@ def block_country(s1: pl.DataFrame, oth: pl.DataFrame, k: dict[str, int] | None 
                 Qr.eliminate_zeros()
                 parts.append(topk_pairs(Qr, BT, (k or {}).get(ch, CHANNEL_SPECS[ch]["k"]),
                                         thresh, f"rank_{ch}", s))
-            parts.append(exact_addr_pairs(oth_keys.filter(pl.col("oi").is_between(s, e - 1)),
+            parts.append(exact_addr_pairs(keys.join(big_keys, on="key", how="semi"),
                                           big, qs["addr"], fitted["addr"][1], s))
             cand = (pl.concat(parts, how="diagonal")
                     .group_by("oi", "si")
@@ -192,18 +196,20 @@ def block_country(s1: pl.DataFrame, oth: pl.DataFrame, k: dict[str, int] | None 
             )
             n_raw += cand.height
             if pruner is not None:
+                in_main = None
+                if cross_fit and pruner["half"]:
+                    in_main = (q["entity_id"].hash(SEED) % 100 < pruner["half"]).to_numpy()[oi - s]
                 cand = stage1.prune(cand, pruner, CHANNELS, RANK_COLS, key="oi",
-                                    in_main_sample=None if in_main is None else in_main[oi],
-                                    pmin=prune_pmin)
-            out.append(cand)
-    cand = pl.concat(out)
-    cand = cand.with_columns(
-        other_id=oth["entity_id"].gather(cand["oi"]),
-        s1_id=s1["entity_id"].gather(cand["si"]),
-    ).drop("oi", "si")
-    print(f"    {n_raw:,} raw -> {cand.height:,} kept candidate pairs for {oth.height:,} records "
-          f"({cand.height / max(oth.height, 1):.2f}/record) in {time.time() - t0:.0f}s", flush=True)
-    return cand
+                                    in_main_sample=in_main, pmin=prune_pmin)
+            cand = cand.with_columns(
+                other_id=q["entity_id"].gather(cand["oi"] - s),
+                s1_id=s1_ids.gather(cand["si"]),
+            ).drop("oi", "si")
+            n_kept += cand.height
+            cand.write_parquet(spill_dir / f"{s:012d}.parquet")
+            del cand, to, parts, q, keys
+    print(f"    {n_raw:,} raw -> {n_kept:,} kept candidate pairs for {n:,} records "
+          f"({n_kept / max(n, 1):.2f}/record) in {time.time() - t0:.0f}s", flush=True)
 
 
 def candidates_path(split: str, pct: int = 100, raw: bool = False):
@@ -211,11 +217,30 @@ def candidates_path(split: str, pct: int = 100, raw: bool = False):
     return WORK_DIR / f"{split}_candidates{tag}.parquet"
 
 
-BLOCK_COLS = ["entity_id", "country", "name_core", "name_norm", "addr_norm"]  # all blocking needs
+BLOCK_COLS = ["entity_id", "name_core", "name_norm", "addr_norm"]  # all blocking needs
+
+
+def _run_signature(split: str, pct: int, raw: bool) -> str:
+    """What a partial blocking run was made with: resumable only if all of this is unchanged."""
+    import hashlib
+    h = hashlib.sha1(f"{split}|{pct}|{raw}".encode())  # CHUNK does not change results
+    h.update(Path(__file__).read_bytes())
+    for f in [stage1.MODEL_PATH, stage1.ALT_PATH] + [
+            norm_path_for(split, src, pct) for src in (1, 2, 3)]:
+        if f.exists():
+            h.update(f"{f.name}:{f.stat().st_size}:{f.stat().st_mtime_ns}".encode())
+    return h.hexdigest()
+
+
+def norm_path_for(split: str, source: int, pct: int):
+    from prep import _source_file
+    return _source_file(split, source, pct)
 
 
 def run(split: str, pct: int = 100, k: dict[str, int] | None = None, raw: bool = False):
-    """raw=True skips stage-1 pruning (used to produce stage-1 training data)."""
+    """raw=True skips stage-1 pruning (used to produce stage-1 training data).
+    Resumable: each finished country leaves a _DONE marker in the spill folder; a re-run with the
+    same inputs and code skips those countries."""
     pruner = None if raw else stage1.load_model()
     if not raw and pruner is None:
         raise SystemExit("stage-1 model missing: run blocking --raw on a train sample, then stage1.py")
@@ -226,22 +251,43 @@ def run(split: str, pct: int = 100, k: dict[str, int] | None = None, raw: bool =
     # ~1.5 in training, which shifts the stage-2 context features (ncand, gaps, ranks)
     seen = set(pl.scan_parquet(pq_path("train", 1)).select(pl.col("country").unique())
                .collect()["country"].to_list())
-    out = []
+    out_path = candidates_path(split, pct, raw)
+    spill = out_path.with_suffix(".parts")
+    sig = _run_signature(split, pct, raw)
+    sig_file = spill / "_SIGNATURE"
+    if spill.exists() and not (sig_file.exists() and sig_file.read_text() == sig):
+        shutil.rmtree(spill)  # partial results from other inputs / code
+    spill.mkdir(exist_ok=True)
+    sig_file.write_text(sig)
     for country in countries:
-        # one country in memory at a time
-        a = load_norm(split, 1, 100, columns=BLOCK_COLS, lazy=True).filter(
-            pl.col("country") == country).collect()
-        b = pl.concat([load_norm(split, s, pct, columns=BLOCK_COLS, lazy=True)
-                       .filter(pl.col("country") == country).collect() for s in (2, 3)])
-        print(f"[{country}] S1={a.height:,} S2/S3={b.height:,}", flush=True)
-        if a.height and b.height:
-            out.append(block_country(a, b, k, pruner, cross_fit=split == "train",
-                                     prune_pmin=UNSEEN_PMIN if country not in seen else None)
-                       .with_columns(country=pl.lit(country)))
+        cdir = spill / country
+        if (cdir / "_DONE").exists():
+            print(f"[{country}] already done (resumed)", flush=True)
+            continue
+        if cdir.exists():
+            shutil.rmtree(cdir)
+        cdir.mkdir()
+        # one country at a time: S1 in memory, the S2/S3 queries streamed from a temp file
+        a = (load_norm(split, 1, 100, columns=BLOCK_COLS + ["country"], lazy=True)
+             .filter(pl.col("country") == country).drop("country").collect())
+        qpath = spill / f"_queries_{country}.parquet"
+        pl.concat([load_norm(split, s, pct, columns=BLOCK_COLS + ["country"], lazy=True)
+                   .filter(pl.col("country") == country).drop("country") for s in (2, 3)]
+                  ).sink_parquet(qpath, row_group_size=CHUNK)
+        n = pl.scan_parquet(qpath).select(pl.len()).collect().item()
+        print(f"[{country}] S1={a.height:,} S2/S3={n:,}", flush=True)
+        if a.height and n:
+            block_country(a, qpath, n, k, pruner, cross_fit=split == "train",
+                          prune_pmin=UNSEEN_PMIN if country not in seen else None, spill_dir=cdir)
+        qpath.unlink()
+        (cdir / "_DONE").touch()
+        del a
     # S2/S3 records whose country never appears in S1 cannot match anything.
-    cand = pl.concat(out)
-    cand.write_parquet(candidates_path(split, pct, raw))
-    return cand
+    parts = [pl.scan_parquet(d / "*.parquet").with_columns(country=pl.lit(d.name))
+             for d in sorted(p for p in spill.iterdir() if p.is_dir()) if any(d.glob("*.parquet"))]
+    pl.concat(parts, how="diagonal").sink_parquet(out_path)
+    shutil.rmtree(spill)
+    return out_path
 
 
 if __name__ == "__main__":

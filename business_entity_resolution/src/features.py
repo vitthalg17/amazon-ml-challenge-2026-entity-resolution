@@ -98,6 +98,8 @@ def build_features(cand: pl.DataFrame, s1: pl.DataFrame, oth: pl.DataFrame,
 
 
 KEYS = ["_o", "_s"]  # 64-bit hashes of other_id / s1_id: cheap group keys for the context step
+CTX_COLS = ([f"{c}_gap_{g}" for c in CTX_BASE for g in "os"]
+            + ["rank_o", "rank_s", "ncand_o", "ncand_s", "cos_sum_margin2_o"])
 
 
 def with_keys(df: pl.DataFrame) -> pl.DataFrame:

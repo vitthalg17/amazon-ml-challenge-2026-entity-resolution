@@ -38,6 +38,7 @@ DEFAULT_ENV = {
     "ER_THREADS": "16",            # LightGBM is deterministic for a fixed thread count
     "ER_BLOCK_CHUNK": "100000",    # S2/S3 records per blocking chunk (memory)
     "ER_FEATURE_PART": "200000",   # candidate pairs per feature part (memory)
+    "PYTHONIOENCODING": "utf-8",   # logs redirected to files: polars tables print box characters
 }
 for k, v in DEFAULT_ENV.items():
     os.environ.setdefault(k, v)
@@ -126,6 +127,8 @@ def main():
     train_pct = a.train_pct if a.train_pct is not None else a.pct
     test_pct = a.test_pct if a.test_pct is not None else a.pct
     steps = [s for s in STEPS if s in a.steps]
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
     if a.one_step:  # child process: run exactly one step in-process
         run_step(steps[0], train_pct, test_pct, a.stage1_pct, a.fit_pct)
         return

@@ -14,13 +14,18 @@ to its best candidate, ...). A small LightGBM re-scores the pairs:
   test   fold-model average
 Stage-2 probabilities used as inputs are themselves out-of-fold / never-fitted (match.score), so
 no label leaks into the sibling features.
+Memory: everything runs per S1-hash part (one short-lived process per part for the sibling
+features, part-by-part matrices for fitting and scoring); only slim hashed tables are global.
 Output: <work>/{train,test}_scores3.parquet.
 """
 import argparse
+import hashlib
 import os
+import shutil
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import lightgbm as lgb
 import numpy as np
@@ -46,6 +51,10 @@ def members_path(split):
     return WORK_DIR / f"{split}_members.parquet"
 
 
+def pctx_path(split):
+    return WORK_DIR / f"{split}_pctx.parquet"
+
+
 def sib_dir(split):
     return WORK_DIR / f"{split}_sib"
 
@@ -56,6 +65,9 @@ def sib_part(split: str, pct: int, i: int, n_parts: int):
     def in_part(col):
         return pl.col(col).hash(SEED) % n_parts == i
 
+    out_path = sib_dir(split) / f"part_{i:03d}.parquet"
+    if out_path.exists():
+        return  # finished in an earlier (interrupted) run
     pairs = (pl.scan_parquet(scores_path(split, 2)).filter(in_part("s1_id"))
              .select("s1_id", "other_id").collect(engine="streaming"))
     mem = (pl.scan_parquet(members_path(split)).filter(in_part("s1_id"))
@@ -97,25 +109,72 @@ def sib_part(split: str, pct: int, i: int, n_parts: int):
         sib_house_n=pl.col("house_eq").count().cast(pl.Int16),
         sib_legal_agree=pl.col("legal_eq").mean(),
     )
+    j = attrs = mem = None  # free before the joins below
     out = pairs.join(agg, on=["s1_id", "other_id"], how="left").with_columns(
         pl.col("sib_n").fill_null(0), pl.col("sib_psum").fill_null(0.0))
-    out.write_parquet(sib_dir(split) / f"part_{i:03d}.parquet")
-    print(f"    sib part {i + 1}/{n_parts}: {pairs.height:,} pairs, {j.height:,} sibling rows",
-          flush=True)
+    ctx = pl.scan_parquet(pctx_path(split)).filter(pl.col("_part") == i).drop("_part").collect()
+    out = (out.with_columns(_o=pl.col("other_id").hash(), _s=pl.col("s1_id").hash())
+           .join(ctx, on=["_o", "_s"], how="left").drop("_o", "_s"))
+    if split == "train":
+        gt = (pl.scan_parquet(WORK_DIR / "train_gt_pairs.parquet").filter(in_part("s1"))
+              .with_columns(label=pl.lit(1, pl.Int8)).collect())
+        out = (out.join(gt, left_on=["s1_id", "other_id"], right_on=["s1", "other"], how="left")
+               .with_columns(pl.col("label").fill_null(0)))
+    tmp = out_path.with_suffix(".tmp")
+    out.select("s1_id", "other_id", *FEATS3, *(["label"] if split == "train" else [])
+               ).write_parquet(tmp)
+    os.replace(tmp, out_path)
+    print(f"    sib part {i + 1}/{n_parts}: {pairs.height:,} pairs", flush=True)
+
+
+def _signature(split: str, n_parts: int) -> str:
+    """Inputs of the sibling parts: resumable only while all of these are unchanged."""
+    h = hashlib.sha1(Path(__file__).read_bytes())
+    f = scores_path(split, 2)
+    h.update(f"{f.stat().st_size}:{f.stat().st_mtime_ns}:{MEMBER_P}:{n_parts}".encode())
+    return h.hexdigest()
+
+
+def _p_context(split: str, n_parts: int):
+    """The stage-2 score in context of the record's other candidates (needs all of them, so it
+    is computed globally, on hashed keys only) -> pctx parquet, sorted by S1 part."""
+    p = pl.col("p").clip(1e-6, 1 - 1e-6)
+    (pl.scan_parquet(scores_path(split, 2))
+     .select(_o=pl.col("other_id").hash(), _s=pl.col("s1_id").hash(),
+             _part=(pl.col("s1_id").hash(SEED) % n_parts).cast(pl.Int32), p=pl.col("p"))
+     .collect(engine="streaming")
+     .with_columns(
+         p_logit=(p / (1 - p)).log(),
+         p_gap_o=pl.col("p").max().over("_o") - pl.col("p"),
+         p_rank_o=pl.col("p").rank("ordinal", descending=True).over("_o").cast(pl.Int16),
+         p_second_o=pl.col("p").sort(descending=True).slice(1, 1).first().over("_o"),
+         ncand_o=pl.len().over("_o").cast(pl.Int16),
+         p_sum_s=pl.col("p").sum().over("_s"),
+         ncand_s=pl.len().over("_s").cast(pl.Int16))
+     .sort("_part")
+     .write_parquet(pctx_path(split), row_group_size=100_000))
 
 
 def build_siblings(split: str, pct: int):
     t = time.time()
-    sc = pl.read_parquet(scores_path(split, 2))
-    (sc.sort("p", descending=True).unique("other_id", keep="first")
-     .filter(pl.col("p") >= MEMBER_P).write_parquet(members_path(split)))
-    n_parts = max(1, -(-sc.height // PAIRS_PER_PART))
-    del sc
+    n_pairs = pl.scan_parquet(scores_path(split, 2)).select(pl.len()).collect().item()
+    n_parts = max(1, -(-n_pairs // PAIRS_PER_PART))
     d = sib_dir(split)
-    d.mkdir(parents=True, exist_ok=True)
-    for f in d.glob("*"):
-        f.unlink()
+    sig = _signature(split, n_parts)
+    if not (d / "_SIG").exists() or (d / "_SIG").read_text() != sig:
+        shutil.rmtree(d, ignore_errors=True)
+        d.mkdir(parents=True)
+        # members: each record's best S1 if p >= MEMBER_P (filter first: only those rows load)
+        (pl.scan_parquet(scores_path(split, 2)).filter(pl.col("p") >= MEMBER_P)
+         .collect(engine="streaming")
+         .sort(["p", "s1_id"], descending=[True, False])
+         .unique("other_id", keep="first", maintain_order=True)
+         .write_parquet(members_path(split)))
+        _p_context(split, n_parts)
+        (d / "_SIG").write_text(sig)
     for i in range(n_parts):  # own process per part (memory is returned to the OS)
+        if (d / f"part_{i:03d}.parquet").exists():
+            continue
         rc = subprocess.call([sys.executable, "-u", __file__, "sib-part", "--split", split,
                               "--pct", str(pct), "--part", str(i), "--nparts", str(n_parts)])
         if rc:
@@ -124,67 +183,76 @@ def build_siblings(split: str, pct: int):
 
 
 # ---------------------------------------------------------------- stage-3 model
-def frame(split: str) -> pl.DataFrame:
-    """Stage-2 score, its context among the record's candidates, and the sibling features."""
-    sc = pl.read_parquet(scores_path(split, 2))
-    sib = pl.concat([pl.read_parquet(f) for f in sorted(sib_dir(split).glob("part_*.parquet"))])
-    p = pl.col("p").clip(1e-6, 1 - 1e-6)
-    df = sc.with_columns(
-        p_logit=(p / (1 - p)).log(),
-        p_gap_o=pl.col("p").max().over("other_id") - pl.col("p"),
-        p_rank_o=pl.col("p").rank("ordinal", descending=True).over("other_id").cast(pl.Int16),
-        p_second_o=pl.col("p").sort(descending=True).slice(1, 1).first().over("other_id"),
-        ncand_o=pl.len().over("other_id").cast(pl.Int16),
-        p_sum_s=pl.col("p").sum().over("s1_id"),
-        ncand_s=pl.len().over("s1_id").cast(pl.Int16),
-    )
-    return df.join(sib, on=["s1_id", "other_id"], how="left")
-
-
 FEATS3 = ["p", "p_logit", "p_gap_o", "p_rank_o", "p_second_o", "ncand_o", "p_sum_s", "ncand_s",
           "sib_n", "sib_psum", "sib_name_max", "sib_name_mean", "sib_addr_max", "sib_addr_mean",
           "sib_street_max", "sib_house_agree", "sib_house_any", "sib_house_n", "sib_legal_agree"]
 
 
+def _parts(split):
+    return sorted(sib_dir(split).glob("part_*.parquet"))
+
+
 def train_and_score(fit_pct: int):
     t = time.time()
-    tr = frame("train")
-    gt = pl.read_parquet(WORK_DIR / "train_gt_pairs.parquet").with_columns(label=pl.lit(1, pl.Int8))
-    tr = (tr.join(gt, left_on=["s1_id", "other_id"], right_on=["s1", "other"], how="left")
-          .with_columns(pl.col("label").fill_null(0)))
-    fit = tr.select(fit_rows(fit_pct) if fit_pct < 100 else pl.lit(True)).to_series().to_numpy()
-    X = tr.select(FEATS3).cast(pl.Float32).to_numpy()
-    y = tr["label"].to_numpy()
-    fold = (tr["s1_id"].hash(SEED) % N_FOLDS).to_numpy()
-    es_group = (tr["s1_id"].hash(SEED + 1) % 10).to_numpy()
-    p3 = np.zeros(len(y), dtype=np.float32)
-    held = ~fit
+    fit_expr = fit_rows(fit_pct) if fit_pct < 100 else pl.lit(True)
+    parts = _parts("train")
+    counts = [pl.scan_parquet(f).filter(fit_expr).select(pl.len()).collect().item() for f in parts]
+    n = sum(counts)
+    X = np.empty((n, len(FEATS3)), dtype=np.float32)
+    y = np.empty(n, dtype=np.int8)
+    fold = np.empty(n, dtype=np.int64)
+    es_group = np.empty(n, dtype=np.int64)
+    off = 0
+    for f, c in zip(parts, counts):
+        df = pl.scan_parquet(f).filter(fit_expr).select("s1_id", "label", *FEATS3).collect()
+        X[off:off + c] = df.select(FEATS3).cast(pl.Float32).to_numpy()
+        y[off:off + c] = df["label"].to_numpy()
+        fold[off:off + c] = (df["s1_id"].hash(SEED) % N_FOLDS).to_numpy()
+        es_group[off:off + c] = (df["s1_id"].hash(SEED + 1) % 10).to_numpy()
+        off += c
+        del df
+    print(f"stage-3: fitting on {n:,} pairs", flush=True)
     models = []
     for f in range(N_FOLDS):
-        va = fit & (fold == f)
-        es = fit & ~va & (es_group == f)
-        trn = fit & ~va & ~es
+        va = fold == f
+        es = ~va & (es_group == f)
+        trn = ~va & ~es
         m = lgb.train(PARAMS, lgb.Dataset(X[trn], y[trn], feature_name=FEATS3), N_ROUNDS,
                       valid_sets=[lgb.Dataset(X[es], y[es])],
                       callbacks=[lgb.early_stopping(100, verbose=False)])
-        p3[va] = m.predict(X[va], num_threads=N_THREADS)
         models.append(m)
         m.save_model(str(WORK_DIR / f"stage3_fold{f}.txt"))
         print(f"stage-3 fold {f}: best_iter={m.best_iteration}", flush=True)
-    if held.any():
-        p3[held] = np.mean([m.predict(X[held], num_threads=N_THREADS) for m in models], axis=0)
     imp = sorted(zip(models[-1].feature_importance("gain"), FEATS3), reverse=True)
     print("stage-3 top features:", [(c, round(g / 1e3)) for g, c in imp[:12]])
-    tr.select("s1_id", "other_id").with_columns(p=pl.Series(p3, dtype=pl.Float32)).write_parquet(
-        scores_path("train", 3))
-    del tr, X
-
-    te = frame("test")
-    Xt = te.select(FEATS3).cast(pl.Float32).to_numpy()
-    pt = np.mean([m.predict(Xt, num_threads=N_THREADS) for m in models], axis=0)
-    te.select("s1_id", "other_id").with_columns(p=pl.Series(pt, dtype=pl.Float32)).write_parquet(
-        scores_path("test", 3))
+    del X, y, fold, es_group
+    _score("train", models, fit_expr)
+    _score("test", models, None)
     print(f"stage-3 done in {time.time() - t:.0f}s", flush=True)
+
+
+def _score(split: str, models, fit_expr):
+    """Part by part: fitted rows get their out-of-fold model (the fold model that never saw
+    their S1 entity), all other rows the fold-model average."""
+    out_dir = WORK_DIR / f"{split}_scores3.parts"
+    shutil.rmtree(out_dir, ignore_errors=True)
+    out_dir.mkdir()
+    for f in _parts(split):
+        df = pl.read_parquet(f, columns=["s1_id", "other_id", *FEATS3])
+        X = df.select(FEATS3).cast(pl.Float32).to_numpy()
+        pr = np.mean([m.predict(X, num_threads=N_THREADS) for m in models], axis=0)
+        if fit_expr is not None:
+            fit = df.select(fit_expr).to_series().to_numpy()
+            fold = (df["s1_id"].hash(SEED) % N_FOLDS).to_numpy()
+            for k, m in enumerate(models):
+                sel = fit & (fold == k)
+                if sel.any():
+                    pr[sel] = m.predict(X[sel], num_threads=N_THREADS)
+        (df.select("s1_id", "other_id").with_columns(p=pl.Series(pr, dtype=pl.Float32))
+         .write_parquet(out_dir / f.name))
+        del df, X
+    pl.scan_parquet(out_dir / "*.parquet").sink_parquet(scores_path(split, 3))
+    shutil.rmtree(out_dir)
 
 
 def run(train_pct: int, test_pct: int, fit_pct: int):

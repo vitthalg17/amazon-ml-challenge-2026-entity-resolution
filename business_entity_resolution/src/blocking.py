@@ -107,23 +107,29 @@ def exact_pairs(s1: pl.DataFrame, oth: pl.DataFrame) -> pl.DataFrame:
 
 
 def exact_addr_pairs(keys: pl.DataFrame, big: pl.DataFrame, Q: sp.csr_matrix, A: sp.csr_matrix,
-                     offset: int, max_pairs: int = 2_000_000) -> pl.DataFrame:
+                     offset: int, max_pairs: int = 1_000_000) -> pl.DataFrame:
     """For S2/S3 records whose name key is shared by many S1 entities (big: key, si), score every
     S1 with that name by address cosine and keep the best EXACT_ADDR_K. Q holds this chunk's
-    address vectors (row = oi - offset), A all S1 address vectors."""
-    j = keys.join(big, on="key").select("oi", "si")
+    address vectors (row = oi - offset), A all S1 address vectors.
+    Records are processed in batches whose joined pairs stay under max_pairs, and each batch is
+    cut to its top EXACT_ADDR_K per record straight away: common Indian names ("X Traders") have
+    hundreds of S1 entities each, and joining a whole chunk at once needed several GB."""
+    empty = pl.DataFrame(schema={"oi": pl.Int32, "si": pl.Int32, "rank_exact_addr": pl.Int8})
+    if keys.height == 0:
+        return empty
+    k = keys.join(big.group_by("key").agg(n=pl.len()), on="key")
+    k = k.with_columns(batch=((pl.col("n").cum_sum() - 1) // max_pairs))
     out = []
-    for s in range(0, j.height, max_pairs):
-        part = j.slice(s, max_pairs)
+    for (_,), kb in k.group_by("batch", maintain_order=True):
+        part = kb.select("oi", "key").join(big, on="key").select("oi", "si")
         oi, si = part["oi"].to_numpy(), part["si"].to_numpy()
-        out.append(part.with_columns(c=pl.Series(row_cosine(Q, A, oi - offset, si))))
+        part = part.with_columns(c=pl.Series(row_cosine(Q, A, oi - offset, si))).filter(pl.col("c") > 0)
+        out.append(part.with_columns(r=pl.col("c").rank("ordinal", descending=True).over("oi") - 1)
+                   .filter(pl.col("r") < EXACT_ADDR_K))  # before the Int8 cast: groups > 127
     if not out:
-        return pl.DataFrame(schema={"oi": pl.Int32, "si": pl.Int32, "rank_exact_addr": pl.Int8})
-    j = pl.concat(out).filter(pl.col("c") > 0)
-    return (j.with_columns(r=pl.col("c").rank("ordinal", descending=True).over("oi") - 1)
-            .filter(pl.col("r") < EXACT_ADDR_K)  # before the Int8 cast: groups can exceed 127
-            .select(pl.col("oi").cast(pl.Int32), pl.col("si").cast(pl.Int32),
-                    rank_exact_addr=pl.col("r").cast(pl.Int8)))
+        return empty
+    return pl.concat(out).select(pl.col("oi").cast(pl.Int32), pl.col("si").cast(pl.Int32),
+                                 rank_exact_addr=pl.col("r").cast(pl.Int8))
 
 
 def block_country(s1: pl.DataFrame, oth: pl.DataFrame, k: dict[str, int] | None = None,

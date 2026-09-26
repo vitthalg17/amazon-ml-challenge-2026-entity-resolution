@@ -80,6 +80,10 @@ def prep(split: str, pct: int = 100):
         # normalize in row slices written as parts, then stream them into one file: peak memory
         # is one slice, not the whole source (test sources have ~5M rows)
         out = norm_path(split, s, pct if s > 1 else 100)
+        # any other normalized version of this source was made with older rules: remove it so
+        # no later step can fall back to it (load_norm picks the smallest covering file)
+        for old in WORK_DIR.glob(f"{split}_s{s}_norm*.parquet"):
+            old.unlink()
         n = lf.select(pl.len()).collect().item()
         parts = []
         for i, off in enumerate(range(0, max(n, 1), PREP_SLICE)):

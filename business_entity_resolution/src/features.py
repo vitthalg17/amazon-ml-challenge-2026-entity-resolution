@@ -22,7 +22,7 @@ from rapidfuzz.distance import JaroWinkler, Levenshtein
 
 N_WORKERS = int(os.environ.get("ER_THREADS", os.cpu_count() or 4))
 SIDE_COLS = ["entity_id", "business_name", "name_norm", "name_core", "name_alt",
-             "addr_norm", "addr_nums", "name_loc", "street"]
+             "addr_norm", "addr_nums", "name_loc", "street", "house"]
 
 FEATURES: list[str] = []  # filled by build_features (order used by the model)
 
@@ -249,6 +249,19 @@ def pair_features(cand: pl.DataFrame, s1: pl.DataFrame, oth: pl.DataFrame,
                          .then(pl.Series(lev, dtype=pl.Int16)),
                          num_first_lendiff=(first.str.len_chars().cast(pl.Int16)
                                             - first1.str.len_chars().cast(pl.Int16)))
+    # house number of the street segment (robust to reordered address parts)
+    h, h1 = pl.col("house"), pl.col("house_1")
+    both = (h != "") & (h1 != "")
+    hlev = process.cpdist(df["house"].to_list(), df["house_1"].to_list(),
+                          scorer=Levenshtein.distance, workers=N_WORKERS, dtype=np.int32)
+    df = df.with_columns(
+        house_eq=pl.when(both).then((h == h1).cast(pl.Int8)),
+        house_lev=pl.when(both).then(pl.Series(hlev, dtype=pl.Int16)),
+        house_prefix=pl.when(both).then((h.str.starts_with(h1) | h1.str.starts_with(h)).cast(pl.Int8)),
+        house_in_nums=pl.when(h1 != "").then(                    # S1 house anywhere in the record
+            pl.col("addr_nums").str.extract_all(r"\d+").list.contains(h1).cast(pl.Int8)),
+        house_missing=((h == "").cast(pl.Int8) + 2 * (h1 == "").cast(pl.Int8)),
+    )
 
     df = df.with_columns(cos_sum=pl.sum_horizontal(pl.col("^cos_.*$")))
     drop = [c for c in df.columns if c in SIDE_COLS or c.endswith("_1") and c[:-2] in SIDE_COLS]

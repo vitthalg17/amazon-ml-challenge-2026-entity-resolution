@@ -25,6 +25,7 @@ import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import lightgbm as lgb
 import numpy as np
@@ -38,12 +39,12 @@ from prep import load_norm
 
 N_THREADS = int(os.environ.get("ER_THREADS", os.cpu_count() or 4))
 N_FOLDS = int(os.environ.get("ER_FOLDS", 4))
-PARAMS = dict(objective="binary", learning_rate=0.05, num_leaves=127, min_data_in_leaf=200,
+PARAMS = dict(objective="binary", learning_rate=0.08, num_leaves=127, min_data_in_leaf=200,
               feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1, lambda_l2=1.0,
               seed=SEED, verbose=-1, num_threads=N_THREADS,
               # identical models on every re-run (same data + same ER_THREADS)
               deterministic=True, force_row_wise=True)
-N_ROUNDS = int(os.environ.get("ER_ROUNDS", 2000))  # early stopping decides; 600 was always hit
+N_ROUNDS = int(os.environ.get("ER_ROUNDS", 3000))  # early stopping decides (2000 @ lr .05 was hit)
 FIT_SEED = SEED + 7  # row sample used for fitting (independent of the blocking/stage-1 buckets)
 MAX_PER_S1 = int(os.environ.get("ER_MAX_PER_S1", 11))
 UNSEEN_COUNTRIES = ("France",)  # in test only
@@ -62,9 +63,21 @@ def _parts(split: str, pct: int) -> list:
     return sorted(d.glob("part_*.parquet")) if (d / "_DONE").exists() else []
 
 
+def _fingerprint(split: str, pct: int) -> str:
+    """Identifies what a feature cache was built from: the feature / normalization code and the
+    candidate file. A change to either invalidates the cache."""
+    import hashlib
+    h = hashlib.sha1()
+    for mod in ("features.py", "normalize.py", "match.py"):
+        h.update((Path(__file__).parent / mod).read_bytes())
+    c = candidates_path(split, pct)
+    h.update(f"{c.stat().st_size}:{c.stat().st_mtime_ns}".encode())
+    return h.hexdigest()
+
+
 def _features_fresh(split: str, pct: int) -> bool:
-    d = feature_dir(split, pct)
-    return (d / "_DONE").exists() and         (d / "_DONE").stat().st_mtime >= candidates_path(split, pct).stat().st_mtime
+    done = feature_dir(split, pct) / "_DONE"
+    return done.exists() and done.read_text().strip() == _fingerprint(split, pct)
 
 
 def build(split: str, pct: int) -> None:
@@ -90,7 +103,7 @@ def build(split: str, pct: int) -> None:
         _child("ctx-join", split, pct, i, n_parts)
     for f in [*d.glob("ctxbase_*.parquet"), d / "ctx.parquet"]:
         f.unlink()
-    (d / "_DONE").touch()
+    (d / "_DONE").write_text(_fingerprint(split, pct))
     n_cols = len(pl.read_parquet_schema(d / "part_000.parquet"))
     print(f"{split}: {n_parts} parts, {n_cols} columns in {time.time() - t:.0f}s")
 
@@ -237,9 +250,22 @@ def finalize(pairs: pl.DataFrame, dec: dict, fr_delta: float = FR_DELTA,
     m = m.filter(~pl.col("s1").is_in(unseen.implode()) | (pl.col("p") >= floor))
     n1 = m.height
     m = m.filter(pl.col("p").rank("ordinal", descending=True).over("s1") <= max_per_s1)
+    n2 = m.height
+    caps = source_caps()  # training maxima per S1 and source, e.g. {"S2": 5, "S3": 6}
+    m = (m.with_columns(src=pl.col("other").str.slice(0, 2))
+         .with_columns(cap=pl.col("src").replace_strict(caps, default=max_per_s1))
+         .filter(pl.col("p").rank("ordinal", descending=True).over("s1", "src") <= pl.col("cap")))
     print(f"guards: {n0 - n1:,} unseen-country pairs below p={floor:.2f} dropped, "
-          f"{n1 - m.height:,} beyond {max_per_s1} per S1 dropped")
+          f"{n1 - n2:,} beyond {max_per_s1} per S1, {n2 - m.height:,} beyond per-source caps {caps}")
     return m.select("s1", "other")
+
+
+def source_caps() -> dict:
+    """Most records one S1 entity has from each source in the training labels."""
+    gt = pl.read_parquet(WORK_DIR / "train_gt_pairs.parquet")
+    c = (gt.with_columns(src=pl.col("other").str.slice(0, 2)).group_by("s1", "src").len()
+         .group_by("src").agg(pl.col("len").max()))
+    return dict(zip(c["src"].to_list(), c["len"].to_list()))
 
 
 def train(pct: int, density_matched: bool = True, fit_pct: int = 100):
@@ -256,13 +282,15 @@ def train(pct: int, density_matched: bool = True, fit_pct: int = 100):
     X = df.select(cols).cast(pl.Float32).to_numpy()
     y = df["label"].to_numpy()
     fold = (df["s1_id"].hash(SEED) % N_FOLDS).to_numpy()
-    # early stopping uses S1 entities held out of the training folds, not the OOF fold itself
-    stop = (df["s1_id"].hash(SEED + 1) % 10 == 0).to_numpy()
+    # early stopping on S1 entities outside the OOF fold; a different 10% slice per fold, so no
+    # row is excluded from fitting by every fold model
+    es_group = (df["s1_id"].hash(SEED + 1) % 10).to_numpy()
     oof = np.zeros(len(y), dtype=np.float32)
     for f in range(N_FOLDS):
         t = time.time()
         va = fold == f
-        tr, es = ~va & ~stop, ~va & stop
+        es = ~va & (es_group == f)
+        tr = ~va & ~es
         m = lgb.train(PARAMS, lgb.Dataset(X[tr], y[tr], feature_name=cols), N_ROUNDS,
                       valid_sets=[lgb.Dataset(X[es], y[es])],
                       callbacks=[lgb.early_stopping(100, verbose=False)])
@@ -276,26 +304,62 @@ def train(pct: int, density_matched: bool = True, fit_pct: int = 100):
     pairs.write_parquet(WORK_DIR / f"train_oof{'' if pct >= 100 else f'_p{pct}'}.parquet")
 
 
-def calibrate(pct: int, density_matched: bool = True, fit_pct: int = 100):
-    """Choose the decision rule on held-out probabilities: out-of-fold for the fitted rows, and
-    the fold-model average for rows never used in fitting (fit_pct < 100). With pct=100 this is
-    a full-density validation over every training S1 entity - the closest match to the test."""
-    pairs = pl.read_parquet(WORK_DIR / f"train_oof{'' if pct >= 100 else f'_p{pct}'}.parquet")
-    if fit_pct < 100:
-        with open(FEATURES_PATH) as fh:
-            cols = json.load(fh)
-        models = [lgb.Booster(model_file=str(WORK_DIR / f"stage2_fold{f}.txt"))
-                  for f in range(N_FOLDS)]
-        held = [pairs.with_columns(pl.col("p").cast(pl.Float32))]
-        for f in _parts("train", pct):
-            df = (pl.scan_parquet(f).filter(~fit_rows(fit_pct))
-                  .select("s1_id", "other_id", *cols).collect(engine="streaming"))
+def scores_path(split: str, stage: int):
+    return WORK_DIR / f"{split}_scores{stage}.parquet"
+
+
+def final_scores(split: str) -> pl.DataFrame:
+    """Stage-3 scores when that stage ran for the current stage-2 scores, else stage-2."""
+    p3, p2 = scores_path(split, 3), scores_path(split, 2)
+    use3 = p3.exists() and p3.stat().st_mtime >= p2.stat().st_mtime
+    print(f"{split}: using stage-{3 if use3 else 2} scores", flush=True)
+    return pl.read_parquet(p3 if use3 else p2)
+
+
+def _fold_models() -> list:
+    return [lgb.Booster(model_file=str(WORK_DIR / f"stage2_fold{f}.txt")) for f in range(N_FOLDS)]
+
+
+def score(pct: int, test_pct: int, fit_pct: int = 100):
+    """Honest stage-2 probability for every candidate pair:
+      train  out-of-fold for fitted rows, fold-model average for rows never used in fitting
+      test   fold-model average
+    -> <work>/train_scores2.parquet, test_scores2.parquet (s1_id, other_id, p)."""
+    with open(FEATURES_PATH) as fh:
+        cols = json.load(fh)
+    models = _fold_models()
+
+    def run(split, p, keep=None):
+        out = []
+        for f in _parts(split, p):
+            lf = pl.scan_parquet(f)
+            if keep is not None:
+                lf = lf.filter(keep)
+            df = lf.select("s1_id", "other_id", *cols).collect(engine="streaming")
             X = df.select(cols).cast(pl.Float32).to_numpy()
-            p = np.mean([m.predict(X, num_threads=N_THREADS) for m in models], axis=0)
-            held.append(df.select("s1_id", "other_id").with_columns(p=pl.Series(p, dtype=pl.Float32)))
+            pr = np.mean([m.predict(X, num_threads=N_THREADS) for m in models], axis=0)
+            out.append(df.select("s1_id", "other_id").with_columns(p=pl.Series(pr, dtype=pl.Float32)))
             del df, X
-        pairs = pl.concat(held)
-        print(f"calibrating on {pairs.height:,} held-out pairs", flush=True)
+        return pl.concat(out) if out else None
+
+    oof = pl.read_parquet(WORK_DIR / f"train_oof{'' if pct >= 100 else f'_p{pct}'}.parquet")
+    parts = [oof.with_columns(pl.col("p").cast(pl.Float32))]
+    if fit_pct < 100:
+        parts.append(run("train", pct, ~fit_rows(fit_pct)))
+    train = pl.concat(parts)
+    train.write_parquet(scores_path("train", 2))
+    if not _features_fresh("test", test_pct):
+        build("test", test_pct)
+    test = run("test", test_pct)
+    test.write_parquet(scores_path("test", 2))
+    print(f"stage-2 scores: train {train.height:,} pairs, test {test.height:,} pairs")
+
+
+def calibrate(pct: int, density_matched: bool = True, fit_pct: int = 100):
+    """Choose the decision rule on held-out train probabilities (see `score`). With pct=100 this
+    is a full-density validation over every training S1 entity - the setting of the test."""
+    pairs = final_scores("train")
+    print(f"calibrating on {pairs.height:,} held-out pairs", flush=True)
     best = evaluate(pairs, pct, rules=("threshold", "entity") if density_matched else ("threshold",))
     with open(WORK_DIR / "decision.json", "w") as fh:
         json.dump(best, fh)
@@ -343,23 +407,11 @@ def evaluate(pairs: pl.DataFrame, pct: int, rules=("threshold", "entity")) -> di
 
 
 def predict(pct: int = 100):
-    """Scores the test feature parts one at a time (the full test feature matrix never exists)."""
-    if not _features_fresh("test", pct):
-        build("test", pct)
-    with open(FEATURES_PATH) as fh:
-        cols = json.load(fh)  # exactly the features the fold models were trained on
-    models = [lgb.Booster(model_file=str(WORK_DIR / f"stage2_fold{f}.txt")) for f in range(N_FOLDS)]
-    scored = []
-    for f in _parts("test", pct):
-        df = pl.read_parquet(f, columns=["s1_id", "other_id", *cols])
-        X = df.select(cols).cast(pl.Float32).to_numpy()
-        p = np.mean([m.predict(X, num_threads=N_THREADS) for m in models], axis=0)
-        scored.append(df.select("s1_id", "other_id").with_columns(p=pl.Series(p, dtype=pl.Float32)))
-        del df, X
-    pairs = pl.concat(scored)
+    """Apply the calibrated decision rule + guards to the final test scores and write outputs."""
+    pairs = final_scores("test")
     with open(WORK_DIR / "decision.json") as fh:
         dec = json.load(fh)
-    pairs.write_parquet(WORK_DIR / "test_scores.parquet")
+    pairs.write_parquet(WORK_DIR / "test_scores.parquet")  # what `decide` re-uses
     print("decision:", dec)
     write_outputs(finalize(pairs, dec), pairs.select("s1_id", "other_id"))
 
@@ -391,8 +443,8 @@ def write_outputs(matches: pl.DataFrame, cands: pl.DataFrame):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["features", "train", "predict", "decide", "feature-part",
-                                    "ctx-join"])
+    ap.add_argument("cmd", choices=["features", "train", "score", "calibrate", "predict", "decide",
+                                    "feature-part", "ctx-join"])
     ap.add_argument("--part", type=int, default=0, help=argparse.SUPPRESS)
     ap.add_argument("--nparts", type=int, default=1, help=argparse.SUPPRESS)
     ap.add_argument("--split", default="train", choices=["train", "test"])
@@ -413,5 +465,9 @@ if __name__ == "__main__":
         redecide(a.fr_delta, a.max_per_s1)
     elif a.cmd == "train":
         train(a.pct, density_matched=(a.test_pct or a.pct) == a.pct, fit_pct=a.fit_pct)
+    elif a.cmd == "score":
+        score(a.pct, a.test_pct or a.pct, a.fit_pct)
+    elif a.cmd == "calibrate":
+        calibrate(a.pct, density_matched=(a.test_pct or a.pct) == a.pct, fit_pct=a.fit_pct)
     else:
         predict(a.pct)

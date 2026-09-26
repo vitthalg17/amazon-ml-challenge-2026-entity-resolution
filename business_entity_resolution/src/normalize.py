@@ -11,6 +11,8 @@ Output columns per record:
               that is not a place
   street      street-name tokens: the address segment holding the house number (else the one
               with a street word), without numbers, street types and fillers ("pachn")
+  house       first number of that street segment ("" if none): the house / plot number,
+              independent of how a source reordered the address parts
 """
 import json
 import re
@@ -36,7 +38,7 @@ NAME_ABBR = {
     "assoc": "associates", "assn": "association", "bros": "brothers",
     "ent": "enterprises", "entp": "enterprises", "mgmt": "management", "dev": "development",
     "grp": "group", "hldgs": "holdings", "inds": "industries", "ind": "industries",
-    "shri": "sri", "shree": "sri", "sree": "sri", "shre": "sri", "sir": "sri",
+    "shri": "sri", "shree": "sri", "sree": "sri", "shre": "sri",
     "n": "and", "et": "and",
 }
 LEGAL = {
@@ -247,11 +249,16 @@ def addr_exprs(col: str = "business_address") -> list[pl.Expr]:
     seg = pl.coalesce(segs.list.eval(pl.element().filter(pl.element().str.contains(r"\d"))).list.first(),
                       segs.list.eval(pl.element().filter(pl.element().str.contains(STREET_HINT))).list.first(),
                       pl.lit(""))
-    street = (_addr_tokens(seg).str.extract_all(r"\S+")
+    seg_tokens = _addr_tokens(seg)
+    street = (seg_tokens.str.extract_all(r"\S+")
               .list.eval(pl.element().filter(~pl.element().str.contains(r"^\d+$")
                                              & ~pl.element().is_in(list(STREET_WORDS))))
               .list.join(" "))
-    return [norm.alias("addr_norm"), nums.alias("addr_nums"), street.alias("street")]
+    # house number: first number of the street segment. Sources reorder the comma parts, so the
+    # first number of the whole address is often a plot / floor / sector number on one side only
+    house = seg_tokens.str.extract(r"\b(\d+)\b").fill_null("")
+    return [norm.alias("addr_norm"), nums.alias("addr_nums"), street.alias("street"),
+            house.alias("house")]
 
 
 def normalize(df: pl.DataFrame | pl.LazyFrame) -> pl.LazyFrame:

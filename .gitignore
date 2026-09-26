@@ -12,3 +12,5 @@ logs/
 archive/
 *.watchdog
 submissions/
+work_v8/
+output_v8/

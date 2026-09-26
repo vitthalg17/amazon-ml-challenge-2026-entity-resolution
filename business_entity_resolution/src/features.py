@@ -156,7 +156,12 @@ def pair_features(cand: pl.DataFrame, s1: pl.DataFrame, oth: pl.DataFrame,
     ad, ad1 = df["addr_norm"].to_list(), df["addr_norm_1"].to_list()
     nl, nl1 = df["name_loc"].to_list(), df["name_loc_1"].to_list()
     st, st1 = df["street"].to_list(), df["street_1"].to_list()
+    # names with the spaces removed: run-together names ("sjyoti" / "jyoti sons")
+    ns = [x.replace(" ", "") for x in nc]
+    ns1 = [x.replace(" ", "") for x in nc1]
     fz = {
+        "n_nospace_ratio": _cp(ns, ns1, fuzz.ratio),
+        "n_nospace_partial": _cp(ns, ns1, fuzz.partial_ratio),
         "n_ratio": _cp(nc, nc1, fuzz.ratio),
         "n_tsort": _cp(nc, nc1, fuzz.token_sort_ratio),
         "n_tset": _cp(nc, nc1, fuzz.token_set_ratio),
@@ -174,7 +179,7 @@ def pair_features(cand: pl.DataFrame, s1: pl.DataFrame, oth: pl.DataFrame,
         "st_partial": _cp(st, st1, fuzz.partial_ratio),
     }
     df = df.with_columns(**{k: pl.Series(v) for k, v in fz.items()})
-    del nc, nc1, nn, nn1, ad, ad1, nl, nl1, st, st1, fz
+    del nc, nc1, nn, nn1, ad, ad1, nl, nl1, st, st1, ns, ns1, fz
     # place features are missing (not 0) when a side has no such tokens
     nl_both = (pl.col("name_loc") != "") & (pl.col("name_loc_1") != "")
     st_both = (pl.col("street") != "") & (pl.col("street_1") != "")

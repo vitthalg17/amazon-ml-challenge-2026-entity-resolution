@@ -202,9 +202,39 @@ def _map_tokens(expr: pl.Expr, table: dict, drop: set | None = None) -> pl.Expr:
     return toks.list.join(" ")
 
 
-def name_exprs(col: str = "business_name") -> list[pl.Expr]:
-    s = _ascii_expr(col, translit_name).str.to_lowercase()
-    s = (s.str.replace_all(r"\bwww\.", " ")
+# digits typed for letters inside a word ("5ystems", "irisventures.c0m")
+LEET = {"0": "o", "1": "i", "3": "e", "4": "a", "5": "s", "7": "t"}
+
+
+def _deleet(s: pl.Expr) -> pl.Expr:
+    tok = pl.element()
+    fix = ((tok.str.count_matches(r"[a-z]") >= 4) & tok.str.contains(r"\d")
+           & (tok.str.count_matches(r"\d") <= 2))
+    return s.str.split(" ").list.eval(
+        pl.when(fix).then(tok.str.replace_many(list(LEET), list(LEET.values()))).otherwise(tok)
+    ).list.join(" ")
+
+
+def _load_splits() -> dict:
+    from segment import SPLITS_PATH
+    if SPLITS_PATH.exists():
+        with open(SPLITS_PATH, encoding="utf-8") as fh:
+            return json.load(fh)
+    return {}
+
+
+SPLITS = _load_splits()  # run-together names -> words (segment.py)
+
+
+def reload_splits():
+    global SPLITS
+    SPLITS = _load_splits()
+
+
+def clean_name(s: pl.Expr) -> pl.Expr:
+    """Lower-case ASCII name -> space-separated a-z0-9 tokens (web / legal punctuation removed)."""
+    s = _deleet(s)
+    return (s.str.replace_all(r"\bwww\.", " ")
           .str.replace_all(r"\.(com|net|org|in|co|biz|info|fr|us|io)\b", " ")
           .str.replace_all(r"&", " and ")
           .str.replace_all(r"#\s*\d+", " ")          # store numbers "#38562"
@@ -215,6 +245,12 @@ def name_exprs(col: str = "business_name") -> list[pl.Expr]:
           .str.replace_all(r"'s\b", "s")
           .str.replace_all(r"[^a-z0-9]+", " ")
           .str.strip_chars())
+
+
+def name_exprs(col: str = "business_name") -> list[pl.Expr]:
+    s = clean_name(_ascii_expr(col, translit_name).str.to_lowercase())
+    if SPLITS:
+        s = _map_tokens(s, SPLITS)
     norm = _map_tokens(s, NAME_ABBR)
     after_dba = norm.str.replace(r"^.*\bdba\b", "").str.strip_chars()
     before_dba = pl.when(norm.str.contains(r"\bdba\b")).then(

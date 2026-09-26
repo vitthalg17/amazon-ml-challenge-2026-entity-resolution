@@ -12,6 +12,7 @@ to choose the decision rule. Every run writes its settings to <work>/run_config.
 Steps (in order):
   ingest               raw TSV -> parquet, ground truth exploded into pairs
   translit             learn Indic-script -> Latin token dictionary from all training matches
+  segment              split run-together names ("northbrothers") using the S1 name vocabulary
   prep_train/prep_test normalize names and addresses
   stage1_data          unpruned candidates on a small train slice (stage-1 training data)
   stage1               train the two cross-fitted stage-1 candidate pruners
@@ -45,7 +46,7 @@ for k, v in DEFAULT_ENV.items():
 
 from config import DATA_DIR, OUTPUT_DIR, WORK_DIR  # noqa: E402
 
-STEPS = ["ingest", "translit", "prep_train", "prep_test", "stage1_data", "stage1",
+STEPS = ["ingest", "translit", "segment", "prep_train", "prep_test", "stage1_data", "stage1",
          "block_train", "block_test", "eval_blocking", "match_features_train",
          "match_features_test", "train", "score", "stage3", "calibrate", "predict", "validate"]
 
@@ -66,6 +67,11 @@ def run_step(step: str, train_pct: int, test_pct: int, stage1_pct: int, fit_pct:
         import translit
         translit.build(100)  # cheap (only Indic-script pairs), so always from all of train
         normalize.reload_translit()
+    elif step == "segment":
+        import normalize
+        import segment
+        segment.build()  # word vocabulary of the S1 names (no labels)
+        normalize.reload_splits()
     elif step == "prep_train":
         prep.prep("train", train_pct)
     elif step == "prep_test":

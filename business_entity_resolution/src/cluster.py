@@ -155,6 +155,16 @@ def _p_context(split: str, n_parts: int):
      .write_parquet(pctx_path(split), row_group_size=100_000))
 
 
+def sib_global(split: str, n_parts: int):
+    # members: each record's best S1 if p >= MEMBER_P (filter first: only those rows load)
+    (pl.scan_parquet(scores_path(split, 2)).filter(pl.col("p") >= MEMBER_P)
+     .collect(engine="streaming")
+     .sort(["p", "s1_id"], descending=[True, False])
+     .unique("other_id", keep="first", maintain_order=True)
+     .write_parquet(members_path(split)))
+    _p_context(split, n_parts)
+
+
 def build_siblings(split: str, pct: int):
     t = time.time()
     n_pairs = pl.scan_parquet(scores_path(split, 2)).select(pl.len()).collect().item()
@@ -164,13 +174,12 @@ def build_siblings(split: str, pct: int):
     if not (d / "_SIG").exists() or (d / "_SIG").read_text() != sig:
         shutil.rmtree(d, ignore_errors=True)
         d.mkdir(parents=True)
-        # members: each record's best S1 if p >= MEMBER_P (filter first: only those rows load)
-        (pl.scan_parquet(scores_path(split, 2)).filter(pl.col("p") >= MEMBER_P)
-         .collect(engine="streaming")
-         .sort(["p", "s1_id"], descending=[True, False])
-         .unique("other_id", keep="first", maintain_order=True)
-         .write_parquet(members_path(split)))
-        _p_context(split, n_parts)
+        # the global tables in a short-lived process: this one then stays small while the
+        # part processes run (polars does not hand freed memory back to the OS)
+        rc = subprocess.call([sys.executable, "-u", __file__, "sib-global", "--split", split,
+                              "--nparts", str(n_parts)])
+        if rc:
+            raise SystemExit(f"sib-global failed ({rc})")
         (d / "_SIG").write_text(sig)
     for i in range(n_parts):  # own process per part (memory is returned to the OS)
         if (d / f"part_{i:03d}.parquet").exists():
@@ -263,7 +272,7 @@ def run(train_pct: int, test_pct: int, fit_pct: int):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["sib-part", "run"])
+    ap.add_argument("cmd", choices=["sib-part", "sib-global", "run"])
     ap.add_argument("--split", default="train")
     ap.add_argument("--pct", type=int, default=100)
     ap.add_argument("--part", type=int, default=0)
@@ -273,5 +282,7 @@ if __name__ == "__main__":
     a = ap.parse_args()
     if a.cmd == "sib-part":
         sib_part(a.split, a.pct, a.part, a.nparts)
+    elif a.cmd == "sib-global":
+        sib_global(a.split, a.nparts)
     else:
         run(a.pct, a.test_pct or a.pct, a.fit_pct)

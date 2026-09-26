@@ -4,6 +4,9 @@ Groups:
   retrieval  - the three blocking cosines and per-channel ranks
   name       - rapidfuzz similarities on core / full names, token Jaccard, DBA alt-name match
   address    - token Jaccard / containment, fuzzy ratios, house-number agreement / conflict
+  place      - name without place words (name_loc) and street-name similarity, plus how many
+               Source 1 entities share the name: when a name is common ("Bordeaux Club" x493)
+               only the street can tell the businesses apart
   rarity     - IDF-weighted overlap (IDF from all Source 1 records): a shared rare token is strong
                evidence for a match, a rare token on one side only is strong evidence against
   record     - lengths, empty address, Indic script, domain-as-name, source
@@ -19,7 +22,7 @@ from rapidfuzz.distance import JaroWinkler
 
 N_WORKERS = int(os.environ.get("ER_THREADS", os.cpu_count() or 4))
 SIDE_COLS = ["entity_id", "business_name", "name_norm", "name_core", "name_alt",
-             "addr_norm", "addr_nums"]
+             "addr_norm", "addr_nums", "name_loc", "street"]
 
 FEATURES: list[str] = []  # filled by build_features (order used by the model)
 
@@ -66,7 +69,7 @@ def _idf(a: str, b: str, idf) -> list[pl.Expr]:
 
 
 CTX_BASE = ("cos_name_word", "cos_name_char", "cos_addr", "cos_combo", "cos_sum", "p1",
-            "n_tset", "a_tset")
+            "n_tset", "a_tset", "nl_tset", "st_tset")
 
 
 def build_features(cand: pl.DataFrame, s1: pl.DataFrame, oth: pl.DataFrame,
@@ -118,16 +121,24 @@ def context_features(base: pl.DataFrame | pl.LazyFrame) -> pl.DataFrame:
 
 def pair_features(cand: pl.DataFrame, s1: pl.DataFrame, oth: pl.DataFrame,
                   name_idf=None, addr_idf=None) -> pl.DataFrame:
-    """All features that depend on one (S2/S3, S1) pair only; safe to compute in chunks."""
+    """All features that depend on one (S2/S3, S1) pair only; safe to compute in chunks.
+    s1 should be all of Source 1: name frequencies are counted over it."""
     name_idf = name_idf or token_idf(s1["name_core"])
     addr_idf = addr_idf or token_idf(s1["addr_norm"])
+    freq = s1.group_by("name_core").agg(pl.len().cast(pl.Int32).alias("_freq"))
     df = (cand
           .join(oth.select(SIDE_COLS), left_on="other_id", right_on="entity_id")
-          .join(s1.select(SIDE_COLS), left_on="s1_id", right_on="entity_id", suffix="_1"))
+          .join(s1.select(SIDE_COLS), left_on="s1_id", right_on="entity_id", suffix="_1")
+          .join(freq.rename({"_freq": "n_core_freq_o"}), on="name_core", how="left")
+          .join(freq.rename({"name_core": "name_core_1", "_freq": "n_core_freq_1"}),
+                on="name_core_1", how="left")
+          .with_columns(pl.col("n_core_freq_o").fill_null(0)))
 
     nc, nc1 = df["name_core"].to_list(), df["name_core_1"].to_list()
     nn, nn1 = df["name_norm"].to_list(), df["name_norm_1"].to_list()
     ad, ad1 = df["addr_norm"].to_list(), df["addr_norm_1"].to_list()
+    nl, nl1 = df["name_loc"].to_list(), df["name_loc_1"].to_list()
+    st, st1 = df["street"].to_list(), df["street_1"].to_list()
     fz = {
         "n_ratio": _cp(nc, nc1, fuzz.ratio),
         "n_tsort": _cp(nc, nc1, fuzz.token_sort_ratio),
@@ -139,13 +150,28 @@ def pair_features(cand: pl.DataFrame, s1: pl.DataFrame, oth: pl.DataFrame,
         "a_tset": _cp(ad, ad1, fuzz.token_set_ratio),
         "a_tsort": _cp(ad, ad1, fuzz.token_sort_ratio),
         "a_partial": _cp(ad, ad1, fuzz.partial_ratio),
+        "nl_tset": _cp(nl, nl1, fuzz.token_set_ratio),
+        "nl_ratio": _cp(nl, nl1, fuzz.ratio),
+        "st_tset": _cp(st, st1, fuzz.token_set_ratio),
+        "st_ratio": _cp(st, st1, fuzz.ratio),
+        "st_partial": _cp(st, st1, fuzz.partial_ratio),
     }
     df = df.with_columns(**{k: pl.Series(v) for k, v in fz.items()})
-    del nc, nc1, nn, nn1, ad, ad1, fz
+    del nc, nc1, nn, nn1, ad, ad1, nl, nl1, st, st1, fz
+    # place features are missing (not 0) when a side has no such tokens
+    nl_both = (pl.col("name_loc") != "") & (pl.col("name_loc_1") != "")
+    st_both = (pl.col("street") != "") & (pl.col("street_1") != "")
+    df = df.with_columns(
+        *[pl.when(nl_both).then(pl.col(c)).alias(c) for c in ("nl_tset", "nl_ratio")],
+        *[pl.when(st_both).then(pl.col(c)).alias(c) for c in ("st_tset", "st_ratio", "st_partial")],
+        nl_both=nl_both.cast(pl.Int8), st_both=st_both.cast(pl.Int8),
+    )
 
     nj, nc_, ni = _jacc("name_core", "name_core_1")
     aj, ac, ai = _jacc("addr_norm", "addr_norm_1")
     mj, mc, mi = _jacc("addr_nums", "addr_nums_1")
+    lj, lc, _ = _jacc("name_loc", "name_loc_1")
+    sj, sc, _ = _jacc("street", "street_1")
     nw = dict(zip(("n_idf_jacc", "n_idf_shared_max", "n_idf_only_o", "n_idf_only_s"),
                   _idf("name_core", "name_core_1", name_idf)))
     aw = dict(zip(("a_idf_jacc", "a_idf_shared_max", "a_idf_only_o", "a_idf_only_s"),
@@ -157,6 +183,13 @@ def pair_features(cand: pl.DataFrame, s1: pl.DataFrame, oth: pl.DataFrame,
         n_jacc=nj, n_contain=nc_, n_inter=ni,
         a_jacc=aj, a_contain=ac, a_inter=ai,
         num_jacc=mj, num_contain=mc, num_inter=mi,
+        nl_jacc=pl.when(nl_both).then(lj), nl_contain=pl.when(nl_both).then(lc),
+        st_jacc=pl.when(st_both).then(sj), st_contain=pl.when(st_both).then(sc),
+        # name tokens that are place words (city / country) on each side
+        n_loc_ntok=(pl.col("name_core").str.count_matches(r"\S+")
+                    - pl.col("name_loc").str.count_matches(r"\S+")).cast(pl.Int16),
+        n_loc_ntok_1=(pl.col("name_core_1").str.count_matches(r"\S+")
+                      - pl.col("name_loc_1").str.count_matches(r"\S+")).cast(pl.Int16),
         # both addresses carry numbers and none agree (e.g. different house / plot numbers)
         num_conflict=((pl.col("addr_nums") != "") & (pl.col("addr_nums_1") != "")
                       & (mi == 0)).cast(pl.Int8),

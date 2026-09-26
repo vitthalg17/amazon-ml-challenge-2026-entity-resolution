@@ -12,6 +12,12 @@ assigned only to its highest-probability S1. Two rules then decide what to keep:
   entity     per S1 entity, keep the top-k assigned records (k may be 0) that maximize the
              entity's expected F0.5, i.e. the metric itself (decision-theoretic F-measure
              optimisation, Ye et al. ICML 2012); `shift` recalibrates p in logit space
+At prediction time two guards follow (see finalize): at most MAX_PER_S1 records per S1 entity
+(the training maximum is 11), and a stricter probability floor for countries absent from
+training (France), where there are no labels to calibrate against.
+
+decide:  re-applies the decision + guards to saved test scores (seconds, no re-scoring), e.g.
+         python match.py decide --fr-delta 0.2
 """
 import argparse
 import json
@@ -36,6 +42,9 @@ PARAMS = dict(objective="binary", learning_rate=0.05, num_leaves=127, min_data_i
               feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1, lambda_l2=1.0,
               seed=SEED, verbose=-1, num_threads=N_THREADS)
 N_ROUNDS = int(os.environ.get("ER_ROUNDS", 600))
+MAX_PER_S1 = int(os.environ.get("ER_MAX_PER_S1", 11))
+UNSEEN_COUNTRIES = ("France",)  # in test only
+FR_DELTA = float(os.environ.get("ER_FR_DELTA", 0.1))  # added to the threshold for those countries
 
 
 PAIRS_PER_PART = int(os.environ.get("ER_FEATURE_PART", 400_000))  # memory knob
@@ -184,6 +193,26 @@ def apply_rule(pairs: pl.DataFrame, dec: dict) -> pl.DataFrame:
     return decide(pairs, dec["threshold"])
 
 
+def finalize(pairs: pl.DataFrame, dec: dict, fr_delta: float = FR_DELTA,
+             max_per_s1: int = MAX_PER_S1) -> pl.DataFrame:
+    """apply_rule, then the prediction-time guards: for S1 entities in UNSEEN_COUNTRIES keep only
+    records with p >= threshold + fr_delta (threshold 0.5 under the entity rule), and keep at
+    most max_per_s1 records (highest p) per S1 entity."""
+    m = apply_rule(pairs, dec).join(
+        pairs.select(pl.col("s1_id").alias("s1"), pl.col("other_id").alias("other"), "p"),
+        on=["s1", "other"])
+    unseen = (load_norm("test", 1, 100, columns=["entity_id", "country"])
+              .filter(pl.col("country").is_in(UNSEEN_COUNTRIES))["entity_id"])
+    floor = dec.get("threshold", 0.5) + fr_delta
+    n0 = m.height
+    m = m.filter(~pl.col("s1").is_in(unseen.implode()) | (pl.col("p") >= floor))
+    n1 = m.height
+    m = m.filter(pl.col("p").rank("ordinal", descending=True).over("s1") <= max_per_s1)
+    print(f"guards: {n0 - n1:,} unseen-country pairs below p={floor:.2f} dropped, "
+          f"{n1 - m.height:,} beyond {max_per_s1} per S1 dropped")
+    return m.select("s1", "other")
+
+
 def train(pct: int, density_matched: bool = True):
     """density_matched=False when train uses a smaller %% of Source 2/3 than test (--train-pct):
     per-S1 aggregates then differ between train and test, so the S1-context features and the
@@ -273,7 +302,16 @@ def predict(pct: int = 100):
         dec = json.load(fh)
     pairs.write_parquet(WORK_DIR / "test_scores.parquet")
     print("decision:", dec)
-    write_outputs(apply_rule(pairs, dec), pairs.select("s1_id", "other_id"))
+    write_outputs(finalize(pairs, dec), pairs.select("s1_id", "other_id"))
+
+
+def redecide(fr_delta: float, max_per_s1: int):
+    """Re-apply the decision to saved test scores with other guard settings."""
+    pairs = pl.read_parquet(WORK_DIR / "test_scores.parquet")
+    with open(WORK_DIR / "decision.json") as fh:
+        dec = json.load(fh)
+    print("decision:", dec, f"fr_delta={fr_delta} max_per_s1={max_per_s1}")
+    write_outputs(finalize(pairs, dec, fr_delta, max_per_s1), pairs.select("s1_id", "other_id"))
 
 
 def _write_lists(pairs: pl.DataFrame, s1_ids: pl.Series, col: str, path):
@@ -294,12 +332,16 @@ def write_outputs(matches: pl.DataFrame, cands: pl.DataFrame):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["features", "train", "predict", "feature-part", "ctx-join"])
+    ap.add_argument("cmd", choices=["features", "train", "predict", "decide", "feature-part",
+                                    "ctx-join"])
     ap.add_argument("--part", type=int, default=0, help=argparse.SUPPRESS)
     ap.add_argument("--nparts", type=int, default=1, help=argparse.SUPPRESS)
     ap.add_argument("--split", default="train", choices=["train", "test"])
     ap.add_argument("--pct", type=int, default=100)
     ap.add_argument("--test-pct", type=int, default=None, help="train only: %% test will use")
+    ap.add_argument("--fr-delta", type=float, default=FR_DELTA,
+                    help="decide: extra probability required for France matches")
+    ap.add_argument("--max-per-s1", type=int, default=MAX_PER_S1, help="decide: cap per S1 entity")
     a = ap.parse_args()
     if a.cmd == "features":
         build(a.split, a.pct)
@@ -307,6 +349,8 @@ if __name__ == "__main__":
         feature_part(a.split, a.pct, a.part, a.nparts)
     elif a.cmd == "ctx-join":
         ctx_join(a.split, a.pct, a.part)
+    elif a.cmd == "decide":
+        redecide(a.fr_delta, a.max_per_s1)
     elif a.cmd == "train":
         train(a.pct, density_matched=(a.test_pct or a.pct) == a.pct)
     else:

@@ -6,6 +6,11 @@ Output columns per record:
   name_alt    the part before "DBA" if present (else empty)
   addr_norm   address tokens after cleaning + abbreviation canonicalisation
   addr_nums   space-joined numeric tokens of the address (house / plot / zip numbers)
+  name_loc    name_core minus tokens that also occur in the record's own address and country
+              words ("Bordeaux Loisirs" at "..., Bordeaux" -> "loisirs"): the part of the name
+              that is not a place
+  street      street-name tokens: the address segment holding the house number (else the one
+              with a street word), without numbers, street types and fillers ("pachn")
 """
 import json
 import re
@@ -24,7 +29,7 @@ NAME_ABBR = {
     "pvt": "private", "prv": "private", "pvtltd": "private limited",
     "ltd": "limited", "ltda": "limited", "lt": "limited",
     "inc": "incorporated", "incorp": "incorporated", "corp": "corporation", "corpn": "corporation",
-    "co": "company", "cos": "company", "coy": "company", "cie": "company",
+    "co": "company", "cos": "company", "coy": "company",
     "intl": "international", "int": "international", "natl": "national",
     "mfg": "manufacturing", "mfrs": "manufacturers", "svcs": "services", "svc": "services",
     "tech": "technologies", "technology": "technologies", "techs": "technologies",
@@ -37,9 +42,10 @@ NAME_ABBR = {
 LEGAL = {
     "private", "limited", "incorporated", "corporation", "company", "llc", "llp", "lp", "plc",
     "pllc", "pc", "pa", "the", "and", "of", "m", "s", "ms", "dba", "a", "an", "sri",
-    # French legal forms (test-only country; keep the list generic)
+    # French legal forms (test-only country; keep the list generic). "societe", "ste" and "cie"
+    # are kept: in names like "Bordeaux Societe" they are the only non-place word
     "sarl", "sas", "sasu", "sa", "eurl", "sci", "snc", "scp", "selarl", "scop", "sca", "gie",
-    "ste", "societe", "ets", "etablissements", "de", "la", "le", "les", "du", "des", "et", "l", "d",
+    "ets", "etablissements", "de", "la", "le", "les", "du", "des", "et", "l", "d",
     # other generic legal words
     "gmbh", "ag", "bv", "nv", "pty", "public",
 }
@@ -106,6 +112,16 @@ ADDR_ABBR = {
     "faubourg": "fbg", "fg": "fbg", "quai": "qu", "cours": "crs", "residence": "res",
     **ORDINAL_WORDS,
 }
+COUNTRY_WORDS = ["france", "india", "usa", "us", "america", "bharat"]
+# street types / fillers removed from the street column (canonical forms after ADDR_ABBR)
+STREET_WORDS = {
+    "rue", "ave", "blvd", "ch", "rte", "all", "imp", "fbg", "qu", "crs", "res", "pl", "st", "rd",
+    "ln", "dr", "ct", "cir", "hwy", "pkwy", "trl", "ter", "sq", "expy", "fwy", "way", "marg",
+    "plot", "sec", "blk", "bldg", "fl", "nr", "opp", "bh", "ph", "extn", "ngr", "col",
+    "de", "du", "des", "la", "le", "les", "l", "d", "n", "s", "e", "w", "ne", "nw", "se", "sw",
+}
+STREET_HINT = (r"\b(rue|r|avenue|av|bd|boulevard|chemin|impasse|allee|route|quai|place|street|st"
+               r"|road|rd|lane|ln|drive|dr|marg|nagar|sector|block)\b")
 ADDR_DROP = {"null", "none", "na", "nan", "no", "ndeg", "number", "num", "nos", "h", "hn", "hno", "door",
              "dno", "box", "unit", "suite", "ste", "apt", "house", "shop", "flat", "at", "and",
              "of", "the", "po", "pin", "pincode", "india", "usa", "us", "france", "bis"}
@@ -208,22 +224,38 @@ def name_exprs(col: str = "business_name") -> list[pl.Expr]:
             _map_tokens(before_dba, {}, LEGAL).alias("name_alt")]
 
 
-def addr_exprs(col: str = "business_address") -> list[pl.Expr]:
-    s = _ascii_expr(col, translit_addr).str.to_lowercase()
-    for k, v in {**US_STATES_MULTI, **IN_STATES_MULTI}.items():
-        s = s.str.replace_all(rf"\b{k}\b", v)
+def _addr_tokens(s: pl.Expr) -> pl.Expr:
     s = (s.str.replace_all(r"\b[cswd]\s*/\s*o\b", " ")             # c/o, s/o, w/o, d/o
           .str.replace_all(r"(\d+)(st|nd|rd|th)\b", "$1")         # 7th / 7nd / 7rd -> 7 ("45 St" kept)
           .str.replace_all(r"(\d)([a-z])", "$1 $2")
           .str.replace_all(r"([a-z])(\d)", "$1 $2")
           .str.replace_all(r"[^a-z0-9]+", " ")
           .str.strip_chars())
-    table = {**ADDR_ABBR, **US_STATES, **IN_STATES}
-    norm = _map_tokens(s, table, ADDR_DROP)
-    norm = norm.str.replace_all(r"\b0+(\d)", "$1")                   # 001555 -> 1555
+    norm = _map_tokens(s, {**ADDR_ABBR, **US_STATES, **IN_STATES}, ADDR_DROP)
+    return norm.str.replace_all(r"\b0+(\d)", "$1")                   # 001555 -> 1555
+
+
+def addr_exprs(col: str = "business_address") -> list[pl.Expr]:
+    s = _ascii_expr(col, translit_addr).str.to_lowercase()
+    for k, v in {**US_STATES_MULTI, **IN_STATES_MULTI}.items():
+        s = s.str.replace_all(rf"\b{k}\b", v)
+    norm = _addr_tokens(s)
     nums = norm.str.extract_all(r"\b\d+\b").list.join(" ")
-    return [norm.alias("addr_norm"), nums.alias("addr_nums")]
+    # street segment: sources reorder the comma parts ("Gironde, BORDEAUX, 18 R ..."), so take
+    # the part with the house number, else the one naming a street type
+    segs = s.str.split(",")
+    seg = pl.coalesce(segs.list.eval(pl.element().filter(pl.element().str.contains(r"\d"))).list.first(),
+                      segs.list.eval(pl.element().filter(pl.element().str.contains(STREET_HINT))).list.first(),
+                      pl.lit(""))
+    street = (_addr_tokens(seg).str.extract_all(r"\S+")
+              .list.eval(pl.element().filter(~pl.element().str.contains(r"^\d+$")
+                                             & ~pl.element().is_in(list(STREET_WORDS))))
+              .list.join(" "))
+    return [norm.alias("addr_norm"), nums.alias("addr_nums"), street.alias("street")]
 
 
 def normalize(df: pl.DataFrame | pl.LazyFrame) -> pl.LazyFrame:
-    return df.lazy().with_columns(*name_exprs(), *addr_exprs())
+    loc = pl.col("addr_norm").str.extract_all(r"\S+").list.concat(pl.lit(COUNTRY_WORDS))
+    name_loc = (pl.col("name_core").str.extract_all(r"\S+").list.set_difference(loc)
+                .list.join(" "))
+    return df.lazy().with_columns(*name_exprs(), *addr_exprs()).with_columns(name_loc=name_loc)

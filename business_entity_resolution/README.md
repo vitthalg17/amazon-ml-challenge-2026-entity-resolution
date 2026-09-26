@@ -70,6 +70,15 @@ Resume from any step, e.g. after changing the model only:
 python pipeline.py --steps train predict validate
 ```
 
+France appears only in test (train is US + India), so predictions there get two guards (see
+`match.finalize`): matches need `p >= threshold + ER_FR_DELTA` (default 0.1), and every S1 entity
+keeps at most `ER_MAX_PER_S1` (default 11, the training maximum) records. To try other values
+without re-scoring (seconds, rewrites `output/`):
+
+```bash
+python match.py decide --fr-delta 0.2      # also --max-per-s1 N
+```
+
 Environment knobs: `ER_THREADS` (default: all cores), `ER_BLOCK_CHUNK` (S2/S3 records per
 blocking chunk, default 300000, lower it if memory is tight), `ER_PRUNE_TOP`, `ER_PRUNE_PMIN`,
 `ER_FOLDS`, `ER_ROUNDS`.

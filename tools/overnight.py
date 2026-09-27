@@ -55,7 +55,16 @@ def wait_for_ram(log, need_mb):
         time.sleep(30)
 
 
+def keep_awake():
+    """No idle sleep while the driver runs (Windows; no admin rights needed). A sleeping laptop
+    froze a run for 3 hours once."""
+    if sys.platform == "win32":
+        import ctypes
+        ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | 0x00000001)
+
+
 def main():
+    keep_awake()
     ap = argparse.ArgumentParser()
     ap.add_argument("--name", required=True)
     ap.add_argument("--train-pct", type=int, default=100)
@@ -68,6 +77,8 @@ def main():
     ap.add_argument("--retries", type=int, default=6)
     ap.add_argument("--title", default=None, help="save the output as a submission when done")
     ap.add_argument("--src", default=str(SRC), help="code folder to run (e.g. a git worktree)")
+    ap.add_argument("--after-pid", type=int, default=None,
+                    help="first wait for this process (e.g. a step already running) to exit")
     a = ap.parse_args()
     src = Path(a.src).resolve()
     LOGS.mkdir(parents=True, exist_ok=True)
@@ -77,6 +88,10 @@ def main():
     state = json.loads(state_file.read_text()) if state_file.exists() else {"done": [], "env": {}}
     env = os.environ.copy()
     env.update(state["env"])
+    if a.after_pid:
+        say(log, f"waiting for process {a.after_pid} to finish")
+        while psutil.pid_exists(a.after_pid):
+            time.sleep(20)
     say(log, f"driver start: {a.steps} (done so far: {state['done']})")
     for step in a.steps:
         if step in state["done"]:

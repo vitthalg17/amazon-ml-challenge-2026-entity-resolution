@@ -47,7 +47,6 @@ PARAMS = dict(objective="binary", learning_rate=0.08, num_leaves=127, min_data_i
 N_ROUNDS = int(os.environ.get("ER_ROUNDS", 3000))  # early stopping decides (2000 @ lr .05 was hit)
 FIT_SEED = SEED + 7  # row sample used for fitting (independent of the blocking/stage-1 buckets)
 MAX_PER_S1 = int(os.environ.get("ER_MAX_PER_S1", 11))
-UNSEEN_COUNTRIES = ("France",)  # in test only
 FR_DELTA = float(os.environ.get("ER_FR_DELTA", 0.1))  # added to the threshold for those countries
 
 
@@ -285,14 +284,17 @@ def apply_rule_ids(pairs: pl.DataFrame, dec: dict) -> pl.DataFrame:
 
 def finalize(pairs: pl.DataFrame, dec: dict, fr_delta: float = FR_DELTA,
              max_per_s1: int = MAX_PER_S1) -> pl.DataFrame:
-    """apply_rule, then the prediction-time guards: for S1 entities in UNSEEN_COUNTRIES keep only
+    """apply_rule, then the prediction-time guards: for S1 entities of countries absent from training keep only
     records with p >= threshold + fr_delta (threshold 0.5 under the entity rule), and keep at
     most max_per_s1 records (highest p) per S1 entity."""
     m = apply_rule_ids(pairs, dec).join(
         pairs.select(pl.col("s1_id").alias("s1"), pl.col("other_id").alias("other"), "p"),
         on=["s1", "other"])
-    unseen = (load_norm("test", 1, 100, columns=["entity_id", "country"])
-              .filter(pl.col("country").is_in(UNSEEN_COUNTRIES))["entity_id"])
+    # countries with no training data (the country field is an open set: nothing hard-coded)
+    seen = pl.scan_parquet(pq_path("train", 1)).select(pl.col("country").unique()).collect()
+    test_s1 = load_norm("test", 1, 100, columns=["entity_id", "country"])
+    unseen = test_s1.filter(~pl.col("country").is_in(seen["country"].implode()))["entity_id"]
+    print(f"unseen countries: {sorted(set(test_s1['country'].unique()) - set(seen['country']))}")
     floor = dec.get("threshold", 0.5) + fr_delta
     n0 = m.height
     m = m.filter(~pl.col("s1").is_in(unseen.implode()) | (pl.col("p") >= floor))

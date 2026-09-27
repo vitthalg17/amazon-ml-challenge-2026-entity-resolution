@@ -9,8 +9,8 @@ For every candidate pair (o, s) the "siblings" are the other records whose best 
 stage-2 probability >= MEMBER_P. Features compare o with its siblings (name, address, street,
 house number, legal form) and summarise the competition for o (its stage-2 probability, the gap
 to its best candidate, ...). A small LightGBM re-scores the pairs:
-  train  fitted on the same fit rows as stage 2, out-of-fold by S1 entity; the other rows get
-         the fold-model average (honest: never fitted)
+  train  fitted on the rows stage 2 held out (their stage-2 inputs are fold-model averages,
+         like test), out-of-fold by S1 entity; the other rows get the fold-model average
   test   fold-model average
 Stage-2 probabilities used as inputs are themselves out-of-fold / never-fitted (match.score), so
 no label leaks into the sibling features.
@@ -221,7 +221,9 @@ def _parts(split):
 
 def train_and_score(fit_pct: int):
     t = time.time()
-    fit_expr = fit_rows(fit_pct) if fit_pct < 100 else pl.lit(True)
+    # fitted on the rows stage 2 did NOT fit: their stage-2 probabilities are fold-model
+    # averages, exactly like test's (the fitted rows carry single-model out-of-fold values)
+    fit_expr = ~fit_rows(fit_pct) if fit_pct < 100 else pl.lit(True)
     parts = _parts("train")
     counts = [pl.scan_parquet(f).filter(fit_expr).select(pl.len()).collect().item() for f in parts]
     n = sum(counts)

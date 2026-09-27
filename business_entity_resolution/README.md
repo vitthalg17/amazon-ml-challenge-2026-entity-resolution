@@ -1,5 +1,9 @@
 # Business Entity Resolution — Amazon ML Challenge 2026
 
+**v10 (current):** the model is trained and validated on data that looks like the test set. Test is a training-like dataset in which about 18.6 % of the Source 1 entities were left out, while their Source 2/3 copies were kept. Those "orphan" records are hard distractors: they compete for similar-named entities.
+
+The `orphans` step hides the same share of training entities (by hash; `ER_ORPHAN_SHARE`, default 0.186) before blocking, so their records become orphans in training too. Train and validation then have the test's distractor mix. v9 validated at 0.9876 on plain training data but scored 0.973 on the leaderboard.
+
 Three-stage pipeline:
 1. **Blocking**: multi-channel TF-IDF retrieval plus exact-name channels, with a stage-1 pruner.
 2. **A LightGBM matching model.**
@@ -23,6 +27,8 @@ src/
   features.py       pair features (rapidfuzz, token overlap, house numbers, context)
   match.py          stage-2 model: training (S1-entity folds), calibration, prediction, outputs
   cluster.py        stage 3: sibling (cluster-consistency) features + re-scoring model
+  segment.py        splits run-together names using the S1 name vocabulary
+  orphans.py        hides 18.6% of train S1 entities: train/validation get the test mix
   metrics.py        macro F0.5 exactly as the leaderboard defines it
   pipeline.py       runs every step in order
   eda.py            exploratory statistics
@@ -58,13 +64,16 @@ decision rule are switched off, because they depend on how many S2/S3 records we
 python pipeline.py --train-pct 30
 ```
 
-The submitted configuration (all train records blocked and featurized, models fitted on 50 % of them, the other 50 % a hold-out) runs in about 5 hours on a 16 GB laptop. Memory stays bounded as follows:
+The submitted configuration runs in about 5 hours on a 16 GB laptop:
+- all train records blocked and featurized, with 18.6 % of the S1 entities hidden;
+- models fitted on 40 % of the records;
+- stage 3 fitted on the other 60 %, which is also the hold-out. Memory stays bounded as follows:
 - Every step and every feature / sibling part runs in its own process.
 - Blocking streams the queries in chunks and spills results to disk.
 - Every step resumes from its finished parts.
 
 ```bash
-python pipeline.py --train-pct 100 --test-pct 100 --fit-pct 50
+python pipeline.py --train-pct 100 --test-pct 100 --fit-pct 40
 ```
 
 `tools/run_guarded.py` adds low CPU priority and a RAM watchdog, which stops the job if available RAM drops below the limit. `tools/overnight.py` runs the steps one by one under that watchdog, waits for free RAM and retries with smaller chunks. From `src/`:

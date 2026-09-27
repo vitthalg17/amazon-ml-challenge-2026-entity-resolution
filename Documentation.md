@@ -76,6 +76,12 @@ Blocking is done **per country**. The Source-1 records of the country are the in
 - Unicode → ASCII transliteration (`anyascii`).
 - A small **Indic → Latin token dictionary learned from the training ground truth** (aligned tokens of matched name pairs; 566 entries). It is cross-fitted on train so that no record sees a dictionary built from its own label.
 - Hand-written lists of legal forms, address abbreviations and US/Indian state names.
+- **Run-together names are split into words** (`segment.py`): `northbrothers` → "north brothers", `infotechgood.com` → "infotech good", `jonesreliablepower` → "jones reliable power".
+  - The vocabulary is the word counts of the Source-1 names (train and test; names only, no labels).
+  - A long token that is rare in that vocabulary is replaced by its most probable split into common words (unigram model, dynamic programming).
+  - Pieces must have 4+ letters and appear in 20+ S1 names, or 3 letters and 1000+ names. This matters because the names contain many invented syllables.
+  - 348 k distinct tokens are split, affecting about 3.4 % of Source-2/3 names. The same table is applied to every source, so identical names stay identical.
+- Digits typed for letters inside a word are mapped back (`5ystems` → "systems", `.c0m` → ".com").
 - Extraction of a core name (legal form and location suffix removed), the street and the house number.
 
 **Stage-1 pruner:**
@@ -84,12 +90,12 @@ Blocking is done **per country**. The Source-1 records of the country are the in
 - Records of countries unseen in training (France) use the same rule.
 
 **Candidate pairs generated:**
-- Test: 16,830,060 pairs for 9.97 M records, about 1.7 per record.
-- Train (full density): [v7 number].
+- Test: 16,068,807 pairs for 9.97 M records (1.61 per record).
+- Train (full density): 15,378,805 pairs for 10.32 M records (1.49 per record; India 1.64, US 1.39 — the same per-country densities as test).
 
 **How true matches were kept:**
 - The channels are complementary: character n-grams catch typos and transliteration, word/bigram channels catch re-ordering, the address channel catches renamed businesses, and the exact-name channels catch chains.
-- Blocking recall is measured against the training ground truth after every change (`eval_blocking.py`). Pair recall is **98.5 %** of all true pairs [v7 number].
+- Blocking recall is measured against the training ground truth after every change (`eval_blocking.py`). Pair recall is **98.59 %** of all 7.64 M true training pairs: 99.65 % when the Source-2/3 record has an address, 78.1 % when it has none. The run-together-name splitting raised it from 98.48 % while producing 4 % fewer candidates.
 - The remaining misses are mostly records with no address that share a very common name, where no text signal can separate them.
 
 ---
@@ -101,6 +107,7 @@ Blocking is done **per country**. The Source-1 records of the country are the in
 **Name features:**
 - `rapidfuzz` ratio, partial ratio, token-sort and token-set ratios, and Jaro-Winkler, on the normalized, core and alternative (transliterated) names.
 - Jaccard and IDF-weighted token overlap (shared and unmatched token weight on each side).
+- Space-insensitive ratio and partial ratio (names with the spaces removed).
 - The frequency of the core name in Source 1 (common names are weak evidence).
 - A comparison of the location suffix of the name.
 
@@ -123,8 +130,8 @@ Blocking is done **per country**. The Source-1 records of the country are the in
 **Training:**
 - LightGBM (learning rate 0.08, 127 leaves, up to 3000 rounds with early stopping) with 4 folds grouped by Source-1 entity.
 - Early stopping uses a different 10 % entity slice per fold.
-- The model is fitted on 30 % of the training Source-2/3 records.
-- The other 70 % is a genuine hold-out, scored by the fold-model average. Every training pair therefore has an honest probability: out-of-fold or never fitted.
+- The model is fitted on 50 % of the training Source-2/3 records (7.7 M pairs).
+- The other 50 % is a genuine hold-out, scored by the fold-model average. Every training pair therefore has an honest probability: out-of-fold or never fitted.
 
 **Stage 3: cluster-consistency re-scoring (LightGBM, 19 features).**
 - An entity's "members" are the records whose best stage-2 match is that entity with p ≥ 0.5.
@@ -156,7 +163,10 @@ Blocking is done **per country**. The Source-1 records of the country are the in
 
 ## 5. Results & Error Analysis
 
-- **F_0.5 Score (macro), held-out validation:** [v7 number]. Leaderboard history: 0.9545 → 0.959 → 0.968 → [v7].
+- **F_0.5 Score (macro), held-out validation:** **0.9876** over all 2.2 M training Source-1 entities (0.9864 when re-weighted to the test distractor mix).
+  - Stage 2 alone: 0.9858.
+  - Pair precision 99.83 %, pair recall 96.63 %.
+  - Leaderboard history: 0.9545 → 0.959 → 0.968 → [final].
 - **Common false positives (wrong merges):**
   - Distractors of the same chain or name at another address.
   - Legal-form swaps (`X Pvt Ltd` vs `X LLP`).
@@ -186,7 +196,7 @@ Lesson: in an F0.5 entity-resolution task, the distractors, not the easy matches
 - `requirements.txt` (polars, scikit-learn, sparse_dot_topn, rapidfuzz, lightgbm, anyascii, numpy, scipy, psutil)
 - `src/`:
   - `pipeline.py`: entry point; runs every step in its own process.
-  - `ingest.py`, `prep.py`, `normalize.py`, `translit.py`: parsing and normalization.
+  - `ingest.py`, `prep.py`, `normalize.py`, `translit.py`, `segment.py`: parsing and normalization.
   - `blocking.py`, `stage1.py`, `eval_blocking.py`: candidate generation.
   - `features.py`, `match.py`: stage-2 features, model, calibration, prediction and outputs.
   - `cluster.py`: stage 3.
@@ -197,7 +207,7 @@ Reproduce:
 ```bash
 pip install -r requirements.txt
 cd src
-python pipeline.py --train-pct 100 --test-pct 100 --fit-pct 30   # -> output/matching_results.tsv, output/candidate_pairs.tsv
+python pipeline.py --train-pct 100 --test-pct 100 --fit-pct 50   # -> output/matching_results.tsv, output/candidate_pairs.tsv
 ```
 
 On a 16 GB machine, wrap the run in `tools/run_guarded.py` (RAM watchdog). Any step can be resumed with `--steps`.
@@ -209,4 +219,6 @@ On a 16 GB machine, wrap the run in `tools/run_guarded.py` (RAM watchdog). Any s
 | v1 | TF-IDF blocking + LightGBM, train 30 % | 0.9686 | 0.9545 |
 | v4 | France fixes, 2000 rounds, guards | 0.9697 | 0.959 |
 | v6 | deeper blocking (exact/exact_addr channels), legal and house-number features, caps | 0.9780 | 0.968 |
-| v7 | full-density training (100 %), S1-context features, entity rule, stage 3 | [v7] | [v7] |
+| v7 | full-density training (100 %), S1-context features, entity rule, stage 3, test-mix calibration | 0.9867 | [v7] |
+| v8 | + run-together name splitting, digit-typo fix, space-insensitive name features | 0.9871 | [v8] |
+| v9 | + models fitted on 50 % of train records (was 30 %) | 0.9876 | [v9] |

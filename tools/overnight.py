@@ -23,6 +23,8 @@ import psutil
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "business_entity_resolution" / "src"
+if not SRC.exists():  # packaged layout: business_entity_resolution/{src,tools}
+    SRC = ROOT / "src"
 LOGS = ROOT / "logs" / "full_runs"
 # memory knob per step: (env var, default, floor)
 KNOBS = {
@@ -67,7 +69,8 @@ def main():
     ap.add_argument("--title", default=None, help="save the output as a submission when done")
     ap.add_argument("--src", default=str(SRC), help="code folder to run (e.g. a git worktree)")
     a = ap.parse_args()
-    src = Path(a.src)
+    src = Path(a.src).resolve()
+    LOGS.mkdir(parents=True, exist_ok=True)
 
     log = LOGS / f"{a.name}.driver.log"
     state_file = LOGS / f"{a.name}.state.json"

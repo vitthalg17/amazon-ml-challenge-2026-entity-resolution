@@ -44,9 +44,8 @@ def main():
         for name in ("README.md", "requirements.txt", "requirements-min.txt"):
             if (pkg / name).exists():
                 z.write(pkg / name, f"code/business_entity_resolution/{name}")
-        for f in ("run_guarded.py", "overnight.py"):
-            if (repo / "tools" / f).exists():
-                z.write(repo / "tools" / f, f"code/business_entity_resolution/tools/{f}")
+        for f in ("run_guarded.py", "overnight.py"):  # latest helpers (not part of the model)
+            z.write(ROOT / "tools" / f, f"code/business_entity_resolution/tools/{f}")
         z.write(a.doc, "Documentation_template.md")
     with zipfile.ZipFile(out) as z:
         names = z.namelist()

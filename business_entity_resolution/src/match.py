@@ -488,6 +488,9 @@ def distractor_weight() -> float:
         return float(os.environ["ER_DISTRACTOR_W"])
     n = {sp: [pl.scan_parquet(pq_path(sp, s)).select(pl.len()).collect().item() for s in (1, 2, 3)]
          for sp in ("train", "test")}
+    # entities actually in the train S1 table (fewer when orphans.py hid some)
+    n["train"][0] = load_norm("train", 1, 100, columns=["entity_id"], lazy=True).select(
+        pl.len()).collect().item()
     true_per_s1 = (pl.scan_parquet(WORK_DIR / "train_gt_pairs.parquet").select(pl.len())
                    .collect().item() / n["train"][0])
     d_train = (n["train"][1] + n["train"][2]) / n["train"][0] - true_per_s1

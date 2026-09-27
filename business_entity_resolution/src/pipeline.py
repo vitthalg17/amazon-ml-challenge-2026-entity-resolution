@@ -46,7 +46,7 @@ for k, v in DEFAULT_ENV.items():
 
 from config import DATA_DIR, OUTPUT_DIR, WORK_DIR  # noqa: E402
 
-STEPS = ["ingest", "translit", "segment", "prep_train", "prep_test", "stage1_data", "stage1",
+STEPS = ["ingest", "translit", "segment", "prep_train", "prep_test", "stage1_data", "stage1", "orphans",
          "block_train", "block_test", "eval_blocking", "match_features_train",
          "match_features_test", "train", "score", "stage3", "calibrate", "predict", "validate"]
 
@@ -80,6 +80,9 @@ def run_step(step: str, train_pct: int, test_pct: int, stage1_pct: int, fit_pct:
         blocking.run("train", min(train_pct, stage1_pct), raw=True)
     elif step == "stage1":
         stage1.train(min(train_pct, stage1_pct))
+    elif step == "orphans":
+        import orphans
+        orphans.run()  # after stage 1 (trained on all entities), before train blocking
     elif step == "block_train":
         blocking.run("train", train_pct)
     elif step == "block_test":

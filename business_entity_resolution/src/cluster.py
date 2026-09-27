@@ -112,7 +112,7 @@ def sib_part(split: str, pct: int, i: int, n_parts: int):
     j = attrs = mem = None  # free before the joins below
     out = pairs.join(agg, on=["s1_id", "other_id"], how="left").with_columns(
         pl.col("sib_n").fill_null(0), pl.col("sib_psum").fill_null(0.0))
-    ctx = pl.scan_parquet(pctx_path(split)).filter(pl.col("_part") == i).drop("_part").collect()
+    ctx = _load_pctx(split, i)
     out = (out.with_columns(_o=pl.col("other_id").hash(), _s=pl.col("s1_id").hash())
            .join(ctx, on=["_o", "_s"], how="left").drop("_o", "_s"))
     if split == "train":
@@ -135,24 +135,42 @@ def _signature(split: str, n_parts: int) -> str:
     return h.hexdigest()
 
 
-def _p_context(split: str, n_parts: int):
-    """The stage-2 score in context of the record's other candidates (needs all of them, so it
-    is computed globally, on hashed keys only) -> pctx parquet, sorted by S1 part."""
+def _p_context(split: str, n_parts: int, n_hash: int = 4):
+    """The stage-2 score in context of the record's other candidates (o) and of the S1
+    entity's candidates (s). Computed on hashed keys, one hash partition of _o (resp. _s) at a
+    time (~1/n_hash of the pairs in memory) -> <split>_pctx_{o,s}_*.parquet, sorted by S1 part."""
     p = pl.col("p").clip(1e-6, 1 - 1e-6)
-    (pl.scan_parquet(scores_path(split, 2))
-     .select(_o=pl.col("other_id").hash(), _s=pl.col("s1_id").hash(),
-             _part=(pl.col("s1_id").hash(SEED) % n_parts).cast(pl.Int32), p=pl.col("p"))
-     .collect(engine="streaming")
-     .with_columns(
-         p_logit=(p / (1 - p)).log(),
-         p_gap_o=pl.col("p").max().over("_o") - pl.col("p"),
-         p_rank_o=pl.col("p").rank("ordinal", descending=True).over("_o").cast(pl.Int16),
-         p_second_o=pl.col("p").sort(descending=True).slice(1, 1).first().over("_o"),
-         ncand_o=pl.len().over("_o").cast(pl.Int16),
-         p_sum_s=pl.col("p").sum().over("_s"),
-         ncand_s=pl.len().over("_s").cast(pl.Int16))
-     .sort("_part")
-     .write_parquet(pctx_path(split), row_group_size=100_000))
+    base = pl.scan_parquet(scores_path(split, 2)).select(
+        _o=pl.col("other_id").hash(), _s=pl.col("s1_id").hash(),
+        _part=(pl.col("s1_id").hash(SEED) % n_parts).cast(pl.Int32), p=pl.col("p"))
+    for f in WORK_DIR.glob(f"{split}_pctx*.parquet"):
+        f.unlink()
+    for j in range(n_hash):
+        (base.filter(pl.col("_o") % n_hash == j).collect(engine="streaming")
+         .with_columns(
+             p_logit=(p / (1 - p)).log(),
+             p_gap_o=pl.col("p").max().over("_o") - pl.col("p"),
+             p_rank_o=pl.col("p").rank("ordinal", descending=True).over("_o").cast(pl.Int16),
+             p_second_o=pl.col("p").sort(descending=True).slice(1, 1).first().over("_o"),
+             ncand_o=pl.len().over("_o").cast(pl.Int16))
+         .sort("_part")
+         .write_parquet(WORK_DIR / f"{split}_pctx_o_{j}.parquet", row_group_size=100_000))
+    for j in range(n_hash):
+        (base.filter(pl.col("_s") % n_hash == j).collect(engine="streaming")
+         .with_columns(p_sum_s=pl.col("p").sum().over("_s"),
+                       ncand_s=pl.len().over("_s").cast(pl.Int16))
+         .select("_o", "_s", "_part", "p_sum_s", "ncand_s")
+         .sort("_part")
+         .write_parquet(WORK_DIR / f"{split}_pctx_s_{j}.parquet", row_group_size=100_000))
+
+
+def _load_pctx(split: str, i: int) -> pl.DataFrame:
+    old = pctx_path(split)
+    if old.exists():  # one table (written by an earlier version of _p_context)
+        return pl.scan_parquet(old).filter(pl.col("_part") == i).drop("_part").collect()
+    co, cs = [pl.scan_parquet(WORK_DIR / f"{split}_pctx_{t}_*.parquet")
+              .filter(pl.col("_part") == i).drop("_part").collect() for t in ("o", "s")]
+    return co.join(cs, on=["_o", "_s"], how="left")
 
 
 def sib_global(split: str, n_parts: int):

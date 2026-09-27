@@ -58,18 +58,22 @@ decision rule are switched off, because they depend on how many S2/S3 records we
 python pipeline.py --train-pct 30
 ```
 
-On a 16 GB laptop, the full-density configuration (v7: all train records blocked and featurized, models fitted on 30 % of them, the other 70 % a hold-out) runs in about 4 hours. Memory stays bounded as follows:
+The submitted configuration (all train records blocked and featurized, models fitted on 50 % of them, the other 50 % a hold-out) runs in about 5 hours on a 16 GB laptop. Memory stays bounded as follows:
 - Every step and every feature / sibling part runs in its own process.
 - Blocking streams the queries in chunks and spills results to disk.
 - Every step resumes from its finished parts.
 
-`tools/overnight.py` (repo root) runs the steps one by one. Each step goes through `tools/run_guarded.py`, which lowers CPU priority and stops the job if available RAM drops below the limit. The driver waits for free RAM and retries with smaller chunks:
+```bash
+python pipeline.py --train-pct 100 --test-pct 100 --fit-pct 50
+```
+
+`tools/run_guarded.py` adds low CPU priority and a RAM watchdog, which stops the job if available RAM drops below the limit. `tools/overnight.py` runs the steps one by one under that watchdog, waits for free RAM and retries with smaller chunks. From `src/`:
 
 ```bash
-ER_BLOCK_CHUNK=50000 python ../../tools/overnight.py --name v7 --train-pct 100 --test-pct 100 \
-    --fit-pct 30 --steps ingest translit prep_train prep_test stage1_data stage1 block_train \
-    block_test eval_blocking match_features_train match_features_test train score stage3 \
-    calibrate predict validate
+ER_BLOCK_CHUNK=50000 python ../tools/overnight.py --src . --name run --train-pct 100 \
+    --test-pct 100 --fit-pct 50 --steps ingest translit segment prep_train prep_test \
+    stage1_data stage1 block_train block_test eval_blocking match_features_train \
+    match_features_test train score stage3 calibrate predict validate
 ```
 
 Resume from any step, e.g. after changing the model only:

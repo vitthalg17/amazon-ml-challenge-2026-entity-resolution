@@ -108,6 +108,13 @@ def sib_part(split: str, pct: int, i: int, n_parts: int):
         sib_house_agree=pl.col("house_eq").mean(), sib_house_any=pl.col("house_eq").max(),
         sib_house_n=pl.col("house_eq").count().cast(pl.Int16),
         sib_legal_agree=pl.col("legal_eq").mean(),
+        # the entity's anchor (most confident member) is almost always a true copy; orphan
+        # records (copies of a business missing from S1) agree with each other, not with it
+        sib_top_name=pl.col("name_sim").sort_by("p2", descending=True).first(),
+        sib_top_addr=pl.col("addr_sim").sort_by("p2", descending=True).first(),
+        sib_top_house=pl.col("house_eq").sort_by("p2", descending=True).first(),
+        sib_dup_n=((pl.col("name_sim") >= 90) & (pl.col("addr_sim") >= 90)).fill_null(False)
+        .sum().cast(pl.Int16),
     )
     j = attrs = mem = None  # free before the joins below
     out = pairs.join(agg, on=["s1_id", "other_id"], how="left").with_columns(
@@ -158,8 +165,9 @@ def _p_context(split: str, n_parts: int, n_hash: int = 4):
     for j in range(n_hash):
         (base.filter(pl.col("_s") % n_hash == j).collect(engine="streaming")
          .with_columns(p_sum_s=pl.col("p").sum().over("_s"),
+                       p_gap_s=pl.col("p").max().over("_s") - pl.col("p"),
                        ncand_s=pl.len().over("_s").cast(pl.Int16))
-         .select("_o", "_s", "_part", "p_sum_s", "ncand_s")
+         .select("_o", "_s", "_part", "p_sum_s", "p_gap_s", "ncand_s")
          .sort("_part")
          .write_parquet(WORK_DIR / f"{split}_pctx_s_{j}.parquet", row_group_size=100_000))
 
@@ -212,7 +220,8 @@ def build_siblings(split: str, pct: int):
 # ---------------------------------------------------------------- stage-3 model
 FEATS3 = ["p", "p_logit", "p_gap_o", "p_rank_o", "p_second_o", "ncand_o", "p_sum_s", "ncand_s",
           "sib_n", "sib_psum", "sib_name_max", "sib_name_mean", "sib_addr_max", "sib_addr_mean",
-          "sib_street_max", "sib_house_agree", "sib_house_any", "sib_house_n", "sib_legal_agree"]
+          "sib_street_max", "sib_house_agree", "sib_house_any", "sib_house_n", "sib_legal_agree",
+          "p_gap_s", "sib_top_name", "sib_top_addr", "sib_top_house", "sib_dup_n"]
 
 
 def _parts(split):
